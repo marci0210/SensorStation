@@ -50,6 +50,7 @@ void send_message(String msg) {
 void connect_to_network(const char* ssid, const char* password) {
     send_message("Connecting to SSID: " + String(ssid));
 
+    WiFi.disconnect();
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
 
@@ -68,10 +69,6 @@ void connect_to_network(const char* ssid, const char* password) {
     } else {
         send_message("\nFailed to connect.");
     }
-}
-
-bool WiFi_isConnected() {
-    return WiFi.isConnected();
 }
 
 void initialize_sensor() {
@@ -96,44 +93,52 @@ void setup() {
         delay(1000);
     }
 
-    connect_to_network(ssid, password);
-    bool success = conn.connect(server_addr, 3307, db_user, db_password);
-    if (success) {
-        send_message("Connected to database.");
-    }
-    else {
-        send_message("Connection to database failed.");
-    }
-
     initialize_sensor();
 
     delay(60000); // Wait for sensor to stabilize
 }
 
 void loop() {
-    if (!bme.performReading()) {
-        send_message("Failed to perform reading :(");
+    if (WiFi.status() != WL_CONNECTED) {
+        send_message("WiFi lost. Reconnecting...");
+        connect_to_network(ssid, password);
     }
-    else {
-        temp = bme.temperature;
-        hum = bme.humidity;
-        pres = bme.pressure / 100.0; // hPa
-        gas = bme.gas_resistance / 1000.0; // KOhms
+    if (WiFi.status() == WL_CONNECTED && !conn.connected()) {
+        send_message("Database disconnected. Reconnecting...");
+        conn.close();
 
-        MySQL_Query query_executor(&conn);
-
-        char query[128];
-        sprintf(query, "INSERT INTO myroom.sensor_data (temperature, humidity, pressure, gas) VALUES (%.2f, %.2f, %.2f, %.2f)", temp, hum, pres, gas);
-
-        send_message("Temp: " + String(temp) + " °C, Humidity: " + String(hum) + " %, Pressure: " + String(pres) + " hPa, Gas: " + String(gas) + " KOhms\n");
-
-        if (query_executor.execute(query)) {
-            send_message("Data successfully sent to MySQL!");
+        if (conn.connect(server_addr, 3307, db_user, db_password)) {
+            send_message("Database connected.");
         } 
         else {
-            send_message("Insert failed. Check connection or table permissions.");
+            send_message("Database reconnection failed.");
         }
-    }    
+    }
+
+    if (WiFi.status() == WL_CONNECTED && conn.connected()) {
+        if (!bme.performReading()) {
+            send_message("Sensor reading failed.");
+        }
+        else {
+            temp = bme.temperature;
+            hum = bme.humidity;
+            pres = bme.pressure / 100.0; // hPa
+            gas = bme.gas_resistance / 1000.0; // KOhms
+
+            char query[256];
+            sprintf(query, "INSERT INTO myroom.sensor_data (temperature, humidity, pressure, gas) VALUES (%.2f, %.2f, %.2f, %.2f)", temp, hum, pres, gas);
+
+            send_message("Temp: " + String(temp) + " °C, Humidity: " + String(hum) + " %, Pressure: " + String(pres) + " hPa, Gas: " + String(gas) + " KOhms\n");
+            
+            MySQL_Query query_executor(&conn);
+            if (query_executor.execute(query)) {
+                send_message("Data successfully sent to MySQL!");
+            } 
+            else {
+                send_message("Insert failed. Check connection or table permissions.");
+            }
+        }
+    } 
 
     delay(300000); // Wait for 5 minutes before next reading
 }
