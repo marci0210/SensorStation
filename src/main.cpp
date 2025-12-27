@@ -55,7 +55,7 @@ void initialize_sensor() {
 
     if (!bme.begin(BME680_I2C_ADDR)) {
         send_message("Could not find a valid BME680 sensor, check wiring!");
-        while (1);
+        while (1); // TODO: handle error properly
     }
 
     // Set up oversampling and filter
@@ -63,7 +63,21 @@ void initialize_sensor() {
     bme.setHumidityOversampling(BME680_OS_2X);
     bme.setPressureOversampling(BME680_OS_4X);
     bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320°C for 150 ms
+    bme.setGasHeater(320, 100); // 320°C for 100 ms
+
+    // Wait for sensor to stabilize
+    delay(2000);
+
+    // Perform initial measurements to initialize IIR filter
+    for (uint8_t i = 0; i < 20; i++) {
+        if (bme.performReading()) {
+            send_message("Initial Sensor Readings:");
+            send_message("Temp: " + String(bme.temperature) + " °C, Humidity: " + String(bme.humidity) + " %, Pressure: " + String(bme.pressure / 100.0) + " hPa, Gas: " + String(bme.gas_resistance / 1000.0) + " KOhms");
+        } else {
+            send_message("Failed to perform initial reading.");
+        }
+        delay(2000); 
+    }
 }
 
 void setup() {
@@ -78,7 +92,6 @@ void setup() {
         ESP.restart();
     }
 
-    delay(60000); // Wait for sensor to stabilize
     initialize_sensor();
 }
 
@@ -109,7 +122,7 @@ void loop() {
             send_message("Sensor reading failed.");
         }
         else {
-            temp = bme.temperature;
+            temp = bme.temperature - 1.0; // offset calibration, TODO: measure accurately
             hum = bme.humidity;
             pres = bme.pressure / 100.0; // hPa
             gas = bme.gas_resistance / 1000.0; // KOhms
@@ -129,5 +142,5 @@ void loop() {
         }
     } 
 
-    delay(300000); // Wait for 5 minutes before next reading
+    delay(60000); // Wait for 1 minute before next reading
 }
