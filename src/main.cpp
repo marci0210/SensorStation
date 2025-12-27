@@ -1,6 +1,7 @@
 #include <Arduino.h>
 
 #include <ESP8266WiFi.h>
+#include <WiFiManager.h>
 
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -22,6 +23,8 @@
 ******************************************************************/
 
 Adafruit_BME680 bme; // I2C
+
+WiFiManager wifiManager;
 
 IPAddress server_addr(192,168,0,151); // NAS IP
 MySQL_Connection conn((Client *)&client);
@@ -47,30 +50,6 @@ void send_message(String msg) {
     }
 }
 
-void connect_to_network(const char* ssid, const char* password) {
-    send_message("Connecting to SSID: " + String(ssid));
-
-    WiFi.disconnect();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-
-    int max_attempts = 20; // Max attempts to connect
-    int attempt = 0;
-
-    while (WiFi.status() != WL_CONNECTED && attempt < max_attempts) {
-        delay(500);
-        send_message(".");
-        attempt++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        send_message("\nConnected successfully!");
-        send_message("IP Address: " + WiFi.localIP().toString());
-    } else {
-        send_message("\nFailed to connect.");
-    }
-}
-
 void initialize_sensor() {
     Wire.begin(D2, D1); // SDA, SCL
 
@@ -93,15 +72,25 @@ void setup() {
         delay(1000);
     }
 
-    initialize_sensor();
+    // connect to WiFi
+    if (!wifiManager.autoConnect("ESP_SensorKit")) {
+        delay(3000);
+        ESP.restart();
+    }
 
     delay(60000); // Wait for sensor to stabilize
+    initialize_sensor();
 }
 
 void loop() {
     if (WiFi.status() != WL_CONNECTED) {
         send_message("WiFi lost. Reconnecting...");
-        connect_to_network(ssid, password);
+        if (wifiManager.autoConnect("ESP_SensorKit")) {
+            send_message("WiFi reconnected.");
+        } 
+        else {
+            send_message("WiFi reconnection failed.");
+        }
     }
     if (WiFi.status() == WL_CONNECTED && !conn.connected()) {
         send_message("Database disconnected. Reconnecting...");
