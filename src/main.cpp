@@ -1,9 +1,6 @@
-#include <Arduino.h>
-
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include <WiFiManager.h>
 
-#include <Wire.h>
 #include <MySQL_Generic.h>
 
 #include <bsec.h>
@@ -17,6 +14,9 @@
 
 #define DEBUG_MODE false
 #define BME680_I2C_ADDR 0x76 // I2C address for your sensor (0x76 or 0x77)
+
+#define SDA_PIN 21
+#define SCL_PIN 22
 
 /******************************************************************
  *     Variables
@@ -78,7 +78,7 @@ void saveState(Bsec &iaqSensor) {
 }
 
 void initialize_sensor() {
-    Wire.begin(D2, D1); // SDA, SCL
+    Wire.begin(SDA_PIN , SCL_PIN );
 
     iaqSensor.begin(BME680_I2C_ADDR, Wire);
 
