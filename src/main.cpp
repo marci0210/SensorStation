@@ -412,20 +412,50 @@ bool is_valid_host(const String &host) {
     return true;
 }
 
+// Accepts a pasted URL too: "https://host:443/path" -> "host". Returns the port found in the URL, or 0.
+long strip_url(String &host) {
+    host.trim();
+    int scheme = host.indexOf("://");
+    if (scheme >= 0) {
+        host = host.substring(scheme + 3);
+    }
+    int slash = host.indexOf('/');
+    if (slash >= 0) {
+        host = host.substring(0, slash);
+    }
+    long port = 0;
+    int colon = host.indexOf(':');
+    if (colon >= 0) {
+        port = host.substring(colon + 1).toInt();
+        host = host.substring(0, colon);
+    }
+    return port;
+}
+
 // Called by WiFiManager when the "Setup" page is saved. All fields are validated first; if anything is
 // invalid nothing is changed.
 void on_setup_saved() {
     String host = String(ingestHostParam.getValue());
-    host.trim();
-    long port = String(ingestPortParam.getValue()).toInt();
+    long urlPort = strip_url(host);
+    String portText = String(ingestPortParam.getValue());
+    portText.trim();
+    long port = portText.length() > 0 ? portText.toInt() : urlPort;
     String certName = String(ingestCertNameParam.getValue());   // optional
-    certName.trim();
+    strip_url(certName);
     float offset = 0.0f;
 
-    if (!is_valid_host(host) || port < 1 || port > 65535 ||
-        (certName.length() > 0 && !is_valid_host(certName)) ||
-        !parse_temp_offset(String(tempOffsetParam.getValue()), offset)) {
-        send_message("Invalid settings, nothing changed.");
+    String error;
+    if (!is_valid_host(host)) {
+        error = "ingest server \"" + host + "\" (only letters, digits, '.', '-')";
+    } else if (port < 1 || port > 65535) {
+        error = "port \"" + portText + "\" (1-65535)";
+    } else if (certName.length() > 0 && !is_valid_host(certName)) {
+        error = "certificate name \"" + certName + "\"";
+    } else if (!parse_temp_offset(String(tempOffsetParam.getValue()), offset)) {
+        error = "temperature offset \"" + String(tempOffsetParam.getValue()) + "\"";
+    }
+    if (error.length() > 0) {
+        send_message("Invalid " + error + ", nothing changed.");
         update_setup_params();   // show the stored values again
         return;
     }
