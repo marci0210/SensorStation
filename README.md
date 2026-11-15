@@ -37,12 +37,14 @@ pick the network.
 - **Persistent calibration**: the BSEC calibration state is saved to flash when the IAQ accuracy improves, every 6 h
   once fully calibrated, and before any self-restart. It is restored on boot.
 - **Status LEDs**: one LED shows Wi-Fi status and four LEDs show the air-quality level.
-- **Captive-portal Wi-Fi setup** through [WiFiManager](https://github.com/tzapu/WiFiManager). The portal closes
-  after 3 minutes so the device never gets stuck in setup mode.
+- **Captive-portal Wi-Fi setup** through [WiFiManager](https://github.com/tzapu/WiFiManager). It opens
+  automatically when the saved network can't be reached, or on demand by **pressing RST twice within 3 seconds**.
+  It closes after 3 minutes so the device never gets stuck in setup mode.
 - **Self-healing connectivity**: Wi-Fi reconnect with periodic retries, the database socket closed on every failure,
   a reboot when nothing has been stored for 15 minutes, and a hardware task watchdog for hangs.
 - **Database logging**: rows are inserted into a MySQL/MariaDB table through
-  [MySQL_MariaDB_Generic](https://github.com/khoih-prog/MySQL_MariaDB_Generic). A PostgreSQL schema is also included
+  [MySQL_MariaDB_Generic](https://github.com/khoih-prog/MySQL_MariaDB_Generic). Server address (IP or host name), port,
+  database, table, user and password are all set in the Wi-Fi portal, no re-flashing needed. A PostgreSQL schema is also included
   (see [Database setup](#database-setup)).
 
 ---
@@ -111,8 +113,9 @@ side) → GND**. They are active-HIGH.
 
 | LED state | Meaning |
 |---|---|
-| Green, white, yellow and red **on**, blue **blinking** | Booting; connecting to the saved Wi-Fi (up to 3 × 30 s) |
-| Blue **solid on**, all others off | Saved Wi-Fi not reachable (or none saved); the **configuration portal** is open for 3 minutes, then the board reboots and tries again |
+| Green, white, yellow and red **on**, blue off (first 3 s) | Double-reset window: press RST again now to open the configuration portal |
+| Green, white, yellow and red **on**, blue **blinking** | Connecting to the saved Wi-Fi (up to 3 × 30 s) |
+| Blue **solid on**, all others off | The **configuration portal** is open: either RST was pressed twice, or the saved Wi-Fi isn't reachable (or none is saved) |
 | All LEDs **off** | Startup finished; waiting for the first IAQ result |
 
 ### Normal operation
@@ -162,18 +165,26 @@ is needed so the library dependency finder evaluates the `#define`s correctly.
 
 ## Configuration
 
-### 1. Database credentials: `inc/config.hpp` (required, not in git)
+### 1. Local secrets: `inc/config.hpp` (optional, not in git)
 
-The database user and password are stored in `inc/config.hpp`. This file is **ignored by git** (`**/config.hpp` in
-`.gitignore`), so after a fresh clone you have to create it:
+`inc/config.hpp` is **ignored by git** (`**/config.hpp` in `.gitignore`). It holds the **portal password** and the
+**default** database credentials, which are used until others are saved in the portal:
 
 ```cpp
 // inc/config.hpp
 #pragma once
 
-char db_user[]     = "your_db_user";
+#define PORTAL_PASSWORD "at-least-8-characters"   // WPA2 password of the ESP_SensorKit setup network
+
+char db_user[]     = "your_db_user";               // defaults; can be changed in the portal
 char db_password[] = "your_db_password";
 ```
+
+- **`PORTAL_PASSWORD` is strongly recommended.** Without it, `ESP_SensorKit` is an **open** network, so anyone nearby
+  could watch the database password being typed in, or use the portal while it's open (including its firmware-update
+  page). The build prints a warning if it's missing. WPA2 requires 8–63 characters, and the build fails otherwise.
+- Without `config.hpp` the firmware still builds. The default credentials are then empty, and you set them in the
+  portal.
 
 ### 2. Settings in `src/main.cpp`
 
@@ -185,9 +196,9 @@ char db_password[] = "your_db_password";
 | `BME680_I2C_ADDR` | `0x76` | Sensor I²C address (`0x76` / `0x77`) |
 | `SDA_PIN` / `SCL_PIN` | `15` / `0` | I²C pins |
 | `*_LED_PIN` | see [Wiring](#leds) | LED pins |
-| `server_addr` | `192.168.0.151` | IP address of the MySQL/MariaDB server |
-| `DB_PORT` | `3307` | Database port (3307 is the MariaDB 10 default on Synology NAS; standard MySQL uses 3306) |
-| Target table | `myroom.sensor_data` | In the `INSERT` query in `send_to_db()` |
+| `DEFAULT_DB_HOST` | `192.168.0.151` | Default database server (see [Database settings](#3-database-settings-in-the-portal)) |
+| `DEFAULT_DB_PORT` | `3307` | Default database port (3307 is the MariaDB 10 default on Synology NAS; standard MySQL uses 3306) |
+| `DEFAULT_DB_NAME` / `DEFAULT_DB_TABLE` | `myroom` / `sensor_data` | Default target table |
 | `WIFI_PORTAL_SSID` | `ESP_SensorKit` | Name of the configuration access point |
 | `WIFI_HOSTNAME` | `SensorStation` | Hostname the device uses on your network (shown in the router's client list) |
 
@@ -197,12 +208,43 @@ char db_password[] = "your_db_password";
 |---|---|---|
 | `SEND_EVERY_N_SAMPLES` | `20` | Samples per database insert. With the 3 s BSEC LP rate this is about 60 s. |
 | `WIFI_CONNECT_TIMEOUT_S` / `WIFI_CONNECT_RETRIES` | `30` / `3` | How long the saved network is tried at boot before the portal opens |
-| `CONFIG_PORTAL_TIMEOUT_S` | `180` | Portal closes after this long and the board reboots (saved credentials are kept) |
+| `CONFIG_PORTAL_TIMEOUT_S` | `180` | Portal closes after this long without page activity, unless a device is connected to it (saved credentials are kept) |
+| `DRD_WINDOW_MS` | 3000 | Double-reset window: a second RST press within this time after boot opens the portal. Also adds this much to every boot. |
 | `WIFI_RECONNECT_INTERVAL_MS` | 30 s | How often `WiFi.reconnect()` is called while offline |
 | `DB_RECONNECT_INTERVAL_MS` | 30 s | Minimum time between DB connection attempts |
 | `NO_DATA_RESTART_MS` | 15 min | Reboot if no row has been stored for this long |
 | `STATE_SAVE_PERIOD_MS` | 6 h | Re-save the calibrated BSEC state this often |
 | `WDT_TIMEOUT_S` | `120` | Hardware watchdog: reboot if `loop()` stops running for this long |
+
+### 3. Database settings (in the portal)
+
+Everything about where and how readings are stored can be changed **without re-flashing**:
+
+1. Open the portal: press **RST twice within 3 s** (see [Changing the Wi-Fi network later](#changing-the-wi-fi-network-later)).
+2. Connect to `ESP_SensorKit` (using `PORTAL_PASSWORD`) and tap **Setup**.
+3. Fill in the fields and tap **Save**:
+
+   | Field | Example | Rules |
+   |---|---|---|
+   | Database server | `192.168.0.151` or `db.example.com` | IP address or host name: letters, digits, `.`, `-` |
+   | Database port | `3307` | 1–65535 |
+   | Database name | `myroom` | Letters, digits, `_` |
+   | Table name | `sensor_data` | Letters, digits, `_` |
+   | Database user | `sensor` | Required, max. 32 characters |
+   | Database password | | **Leave empty to keep the current password.** Max. 64 characters. |
+
+4. Tap **Exit**. The device connects to the saved Wi-Fi and uses the new settings.
+
+- All values are stored in flash (namespace `dbcfg`), so they survive reboots and firmware updates.
+  `.\flash.ps1 -Erase` resets them to the defaults.
+- **Everything is validated first.** If any field is invalid, nothing is changed and the stored values stay. The portal
+  still says "Setup saved", so open **Setup** again to check what's stored.
+- **The password field is never pre-filled**, so the stored password doesn't appear in the page. Because empty means
+  "keep the current one", an empty database password can't be set from the portal.
+- The database and table names are inserted into the SQL statement, which is why only letters, digits and `_` are
+  allowed. The table must have the columns `temperature`, `humidity`, `iaq` and `iaq_accuracy` (see
+  [db/](db/)).
+- Wi-Fi and database settings are on separate pages, so changing one doesn't require re-entering the other.
 
 ---
 
@@ -223,7 +265,7 @@ mysql -h <nas-ip> -P 3307 -u root -p < db/mysql/setup.sql
 
 The script creates the `myroom` database, the `myroom.sensor_data` table (with an auto `id` and a server-side
 `created_at` timestamp) and an insert-only user `sensor@192.168.0.%`. Change the password in the script and put the
-same credentials in `inc/config.hpp`. The server must accept **TCP connections from the LAN** (not just `localhost`),
+same credentials in the portal's **Setup** page (or as defaults in `inc/config.hpp`). The server must accept **TCP connections from the LAN** (not just `localhost`),
 and the user must use `mysql_native_password`, which is the only authentication MySQL_MariaDB_Generic supports.
 
 ### PostgreSQL
@@ -248,6 +290,28 @@ The script is idempotent (safe to re-run) and must be run with `psql`. It create
 
 ## Build and flash
 
+### Windows: `flash.ps1` (recommended)
+
+The script builds the firmware, **finds the board's COM port automatically** and uploads:
+
+```powershell
+.\flash.ps1              # build + flash, auto-detect the port
+.\flash.ps1 -Monitor     # ...and open the serial monitor afterwards
+.\flash.ps1 -Port COM5   # use a specific port
+.\flash.ps1 -Erase       # wipe the flash first (forgets Wi-Fi + BSEC calibration)
+.\flash.ps1 -List        # only show the detected ports, don't flash
+```
+
+Port detection looks for the USB-serial chips used on ESP32 boards (CH340/CH9102, CP210x, FTDI, Espressif native
+USB) and ignores other COM ports, such as the motherboard's COM1. If more than one board is plugged in, it asks which
+one to use. It warns if `inc/config.hpp` or its `PORTAL_PASSWORD` is missing, and finds `pio` even when it isn't on
+`PATH`.
+
+If PowerShell refuses to run the script (execution policy), use
+`powershell -ExecutionPolicy Bypass -File .\flash.ps1`.
+
+### PlatformIO CLI
+
 Using the PlatformIO CLI (or the matching buttons in the VS Code PlatformIO toolbar):
 
 ```bash
@@ -267,19 +331,34 @@ The only environment is `lolin32`.
 
 ## First boot and Wi-Fi setup
 
-1. Power the board. All four IAQ LEDs light up and the blue LED blinks while the ESP32 tries the saved network
-   (3 attempts × 30 s).
-2. If that fails, or no network has been saved yet, the blue LED stays on and the device starts an open access point
-   named **`ESP_SensorKit`**.
+1. Power the board. All four IAQ LEDs light up. After 3 s the blue LED starts blinking while the ESP32 tries the
+   saved network (3 attempts × 30 s).
+2. If that fails, or no network has been saved yet, the blue LED stays on and the device starts an access point
+   named **`ESP_SensorKit`**. Its password is `PORTAL_PASSWORD` from `inc/config.hpp`; without one, it's an open
+   network.
 3. Connect to it from a phone or laptop. The captive portal should open on its own; if it doesn't, go to
    **http://192.168.4.1**.
 4. Choose your Wi-Fi network, enter the password and save. The ESP32 stores the credentials and connects.
-5. If nobody finishes the portal within **3 minutes**, the board reboots and tries the saved network again. The
-   credentials are **never erased**, so after a power cut the device keeps cycling (about 4.5 min per round) until the
-   router is back, then reconnects on its own.
+5. The portal stays open while your phone is connected to `ESP_SensorKit`. Once nothing is connected and no page has
+   been loaded for **3 minutes**, the board reboots and tries the saved network again. The credentials are **never
+   erased**, so after a power cut the device keeps retrying until the router is back, then reconnects on its own.
 
-To switch networks later, make the saved network unavailable (the portal opens on the next boot), or erase the flash
-with `pio run -t erase` and re-flash.
+### Changing the Wi-Fi network later
+
+**Press the RST button twice, within 3 seconds** (the second press while the four IAQ LEDs are lit after the first
+one). The blue LED turns solid and the `ESP_SensorKit` portal opens. Then continue from step 3 above.
+
+- The old credentials stay saved until you save new ones. If you close the portal without saving, the device goes
+  back to the old network after 3 minutes.
+- The BSEC calibration is **not** affected.
+- If you changed your router's name or password, you don't need to do anything: the saved network fails and the
+  portal opens by itself after about 1.5 minutes.
+- `.\flash.ps1 -Erase` also resets Wi-Fi, but it **deletes the BSEC calibration** too, because both are stored in the
+  same flash area.
+
+The double reset is detected with a flag in flash, not in RTC memory, because on the ESP32 the RST (EN) button cuts
+power to the whole chip. The BOOT button can't be used for this: on this board it's wired to GPIO 0, the sensor's SCL
+line, and holding it during reset puts the ESP32 into flashing mode.
 
 ---
 
@@ -288,6 +367,10 @@ with `pio run -t erase` and re-flash.
 ```
 setup()
  ├─ configure LED pins, all IAQ LEDs on
+ ├─ load_db_config(): database host/port from flash (defaults 192.168.0.151:3307)
+ ├─ check_double_reset(): flag in flash set → this is the 2nd reset → open portal on demand;
+ │    otherwise set the flag, wait 3 s, clear it
+ ├─ (on demand) WiFiManager.startConfigPortal() → on timeout continue with the saved network
  ├─ WiFiManager.autoConnect("ESP_SensorKit")
  │    ├─ try saved network: 3 × 30 s (blue LED blinking)
  │    └─ otherwise open portal (blue solid) for 180 s → reboot on timeout
@@ -318,6 +401,7 @@ fixes:
 
 | Problem | Cause | Fix |
 |---|---|---|
+| No way to switch networks while the old one is still up | The portal only opened when the saved network failed. | Press RST twice within 3 s to open the portal on demand. |
 | Device "forgets" the Wi-Fi after a power cut | The ESP32 boots faster than the router. The saved network wasn't found, the WiFiManager portal opened, and it had **no timeout**, so the device sat in AP mode forever. (The 20 s boot wait loop also never called `WiFi.begin()`, so it couldn't connect.) | Saved network tried 3 × 30 s, portal timeout of 3 min, then reboot. Credentials are kept. |
 | Stops sending data and never recovers | MySQL_MariaDB_Generic leaves the TCP socket open when the login or a query times out. `conn.connected()` then kept returning `true`, so the firmware never reconnected and every INSERT failed. | `db_disconnect()` closes the socket after every failed connect or query, and after every Wi-Fi drop. |
 | Flaky reconnects | `WiFi.begin()` was called every 3 s while offline, interrupting the driver's own reconnect. Wi-Fi modem sleep also causes drops on many routers. | Driver auto-reconnect plus `WiFi.reconnect()` every 30 s; `WiFi.setSleep(false)`. |
@@ -355,10 +439,11 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
 ```
 .
 ├── platformio.ini            # PlatformIO environment (lolin32), build flags, library dependencies
+├── flash.ps1                 # Build + flash with automatic COM port detection (Windows)
 ├── src/
 │   └── main.cpp              # The whole firmware
 ├── inc/
-│   └── config.hpp            # DB credentials (git-ignored, create it yourself)
+│   └── config.hpp            # Portal password + default DB credentials (optional, git-ignored)
 ├── db/
 │   ├── mysql/setup.sql       # MySQL/MariaDB schema + device user (used by the firmware)
 │   └── postgresql/setup.sql  # PostgreSQL schema, views and roles
@@ -373,14 +458,17 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
 
 | Symptom | Possible cause / fix |
 |---|---|
-| Build fails with `config.hpp: No such file or directory` | Create `inc/config.hpp` (see [Configuration](#1-database-credentials-incconfighpp-required-not-in-git)). |
+| Build warning `PORTAL_PASSWORD not defined` | Add `#define PORTAL_PASSWORD "..."` to `inc/config.hpp` (see [Configuration](#1-local-secrets-incconfighpp-optional-not-in-git)). |
+| Can't connect to `ESP_SensorKit` | Since `PORTAL_PASSWORD` was added, the network asks for that password. |
 | Nothing on the serial monitor | `DEBUG_MODE` is `false` by default. Set it to `true` and re-flash. The first line printed is the reset reason, which helps tell a watchdog reboot from a power cut. |
 | IAQ stays at 25 and accuracy stays at 0 | Normal during the first few minutes or hours (BSEC run-in). Leave it running. |
 | No sensor data at all | Check the wiring and I²C address (`0x76` vs `0x77`). Make sure the BME680 runs on 3.3 V. |
 | Board doesn't boot / hangs at reset | Something may be pulling GPIO 0 or GPIO 15 low (strapping pins). Disconnect the sensor and check, or move I²C to other pins. |
 | Blue LED blinking | Wi-Fi lost. The device reconnects on its own and reboots after 15 min if that doesn't work. |
-| Blue LED solid, `ESP_SensorKit` network visible | Saved network not reachable. Wait for the next reboot cycle (3 min), or set up a new network in the portal. |
-| Board reboots about every 15 min | No row is reaching the database: check the server IP/port, that the DB accepts remote connections, the user's host/privileges, and that the `myroom.sensor_data` table exists. |
+| Blue LED solid, `ESP_SensorKit` network visible | Portal is open: RST was pressed twice, or the saved network isn't reachable. Set up a network, or wait 3 min. |
+| Portal opens right after flashing or opening the serial monitor | The monitor reset the board within 3 s of the post-upload reset. `platformio.ini` sets `monitor_rts = 0` / `monitor_dtr = 0` to prevent this; check that your monitor tool doesn't toggle DTR/RTS. |
+| Portal opened after a quick power flicker | Expected: a power cut within 3 s of booting counts as a double reset. The portal closes after 3 min and the device reconnects. |
+| Board reboots about every 15 min | No row is reaching the database: check the settings in the portal's **Setup** page (a typo in the host name, user, password or table name fails silently), that the DB accepts remote connections, the user's host/privileges, and that the table exists. |
 | Captive portal doesn't show up | Connect to `ESP_SensorKit` and browse to `http://192.168.4.1` manually. |
 | Onboard LED lights up | Expected: it's on GPIO 5 (active-LOW) and is lit whenever the green LED is off. |
 
@@ -388,7 +476,11 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
 
 ## Known limitations / notes
 
-- **Hard-coded network settings**: the server IP, port and database/table names are compiled into the firmware.
+- **Credentials stored unencrypted in flash**: the database password is kept in NVS in plain text, so anyone with
+  physical access and a USB cable can read it out. Give the device's DB user only `INSERT` rights on its table, as
+  the setup scripts in [db/](db/) do.
+- **Plain MySQL over TCP, no TLS**: fine on a home LAN. A database in the cloud (e.g. OpenShift) needs an encrypted
+  path, either a TLS-capable client or an HTTPS ingest service in front of the database.
 - **MySQL only**: the firmware uses the MySQL protocol. The PostgreSQL script is ready, but the firmware's database
   code has to be ported before it can use it.
 - **No clock on the device**: there is no RTC/NTP, so timestamps come from the database (`created_at`).

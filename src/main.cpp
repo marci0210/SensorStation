@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <Ticker.h>
+#include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 
@@ -9,7 +10,25 @@
 #include <bsec.h>
 #include <EEPROM.h>
 
-#include "config.hpp"
+// Optional, git-ignored local settings: default DB credentials and the portal's Wi-Fi password.
+//   char db_user[] = "...";  char db_password[] = "...";  #define PORTAL_PASSWORD "..."
+#if __has_include("config.hpp")
+    #include "config.hpp"
+    #define DEFAULT_DB_USER         db_user
+    #define DEFAULT_DB_PASSWORD     db_password
+#else
+    #define DEFAULT_DB_USER         ""
+    #define DEFAULT_DB_PASSWORD     ""
+#endif
+
+#ifdef PORTAL_PASSWORD
+    static_assert(sizeof(PORTAL_PASSWORD) - 1 >= 8 && sizeof(PORTAL_PASSWORD) - 1 <= 63,
+                  "PORTAL_PASSWORD must be 8..63 characters (WPA2)");
+    static const char *portalPassword = PORTAL_PASSWORD;
+#else
+    #warning "PORTAL_PASSWORD not defined in config.hpp: the setup portal is an OPEN network and DB credentials typed into it are sent unencrypted"
+    static const char *portalPassword = NULL;
+#endif
 
 /******************************************************************
  *     Defines
@@ -27,7 +46,16 @@
 #define YELLOW_LED_PIN 33
 #define RED_LED_PIN 32
 
-#define DB_PORT 3307
+// Database: defaults only. The real values are set in the Wi-Fi portal ("Setup" page) and kept in flash.
+#define DEFAULT_DB_HOST             "192.168.0.151"   // NAS
+#define DEFAULT_DB_PORT             3307
+#define DEFAULT_DB_NAME             "myroom"
+#define DEFAULT_DB_TABLE            "sensor_data"
+#define DB_HOST_MAX_LEN             64
+#define DB_USER_MAX_LEN             32
+#define DB_PASS_MAX_LEN             64
+#define DB_IDENT_MAX_LEN            64                // database / table name (MySQL limit)
+#define DB_CFG_NAMESPACE            "dbcfg"
 
 // Timing
 #define SEND_EVERY_N_SAMPLES        20u                              // 20 x 3 s (BSEC LP rate) ~= 60 s
@@ -43,6 +71,11 @@
 #define WIFI_CONNECT_TIMEOUT_S      30     // per attempt with the saved credentials
 #define WIFI_CONNECT_RETRIES        3
 #define CONFIG_PORTAL_TIMEOUT_S     180    // close the portal and reboot; saved credentials are kept
+
+// Press RST twice within this window to open the config portal on demand
+#define DRD_WINDOW_MS               3000u
+#define DRD_NAMESPACE               "drd"
+#define DRD_KEY                     "pending"
 
 // Hardware watchdog: reboots if loop() stops running (a DB connect can block for ~50 s)
 #define WDT_TIMEOUT_S               120
@@ -65,7 +98,22 @@ WiFiManager wifiManager;
 Ticker blueBlinker;
 volatile bool blueLedState = false;
 
-IPAddress server_addr(192,168,0,151); // NAS IP
+char dbHost[DB_HOST_MAX_LEN + 1] = DEFAULT_DB_HOST;   // IP address or host name
+uint16_t dbPort = DEFAULT_DB_PORT;
+char dbName[DB_IDENT_MAX_LEN + 1] = DEFAULT_DB_NAME;
+char dbTable[DB_IDENT_MAX_LEN + 1] = DEFAULT_DB_TABLE;
+char dbUser[DB_USER_MAX_LEN + 1] = "";
+char dbPassword[DB_PASS_MAX_LEN + 1] = "";
+
+// Portal "Setup" page fields. The password field is never pre-filled: empty = keep the current password.
+WiFiManagerParameter dbHostParam("db_host", "Database server (IP address or host name)", "", DB_HOST_MAX_LEN);
+WiFiManagerParameter dbPortParam("db_port", "Database port", "", 5, "type='number' min='1' max='65535'");
+WiFiManagerParameter dbNameParam("db_name", "Database name", "", DB_IDENT_MAX_LEN);
+WiFiManagerParameter dbTableParam("db_table", "Table name", "", DB_IDENT_MAX_LEN);
+WiFiManagerParameter dbUserParam("db_user", "Database user", "", DB_USER_MAX_LEN, "autocomplete='off'");
+WiFiManagerParameter dbPassParam("db_pass", "Database password (leave empty to keep the current one)", "", DB_PASS_MAX_LEN,
+                                 "type='password' autocomplete='new-password'");
+
 MySQL_Connection conn((Client *)&client);   // `client` is the WiFiClient declared by MySQL_Generic
 
 uint32_t sampleCounter = 0u;
@@ -246,6 +294,112 @@ void initialize_sensor() {
 }
 
 /******************************************************************
+ *     Database settings (configurable in the portal)
+******************************************************************/
+
+// Copy the current values into the portal form fields (never the password)
+void update_db_params() {
+    char portStr[6];
+    snprintf(portStr, sizeof(portStr), "%u", (unsigned)dbPort);
+    dbHostParam.setValue(dbHost, DB_HOST_MAX_LEN);
+    dbPortParam.setValue(portStr, 5);
+    dbNameParam.setValue(dbName, DB_IDENT_MAX_LEN);
+    dbTableParam.setValue(dbTable, DB_IDENT_MAX_LEN);
+    dbUserParam.setValue(dbUser, DB_USER_MAX_LEN);
+    dbPassParam.setValue("", DB_PASS_MAX_LEN);
+}
+
+void load_db_config() {
+    Preferences prefs;
+    prefs.begin(DB_CFG_NAMESPACE, false);
+    prefs.getString("host", DEFAULT_DB_HOST).toCharArray(dbHost, sizeof(dbHost));
+    dbPort = prefs.getUShort("port", DEFAULT_DB_PORT);
+    prefs.getString("db", DEFAULT_DB_NAME).toCharArray(dbName, sizeof(dbName));
+    prefs.getString("table", DEFAULT_DB_TABLE).toCharArray(dbTable, sizeof(dbTable));
+    prefs.getString("user", DEFAULT_DB_USER).toCharArray(dbUser, sizeof(dbUser));
+    prefs.getString("pass", DEFAULT_DB_PASSWORD).toCharArray(dbPassword, sizeof(dbPassword));
+    prefs.end();
+
+    update_db_params();
+    send_message("Database: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) + " -> " +
+                 String(dbName) + "." + String(dbTable));
+}
+
+// Host name or IPv4 address: letters, digits, '.', '-'
+bool is_valid_host(const String &host) {
+    if (host.length() == 0 || host.length() > DB_HOST_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < host.length(); i++) {
+        char c = host[i];
+        if (!isalnum(c) && c != '.' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Database / table name. Restricted to letters, digits and '_' because it is inserted into the SQL text.
+bool is_valid_identifier(const String &name) {
+    if (name.length() == 0 || name.length() > DB_IDENT_MAX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < name.length(); i++) {
+        char c = name[i];
+        if (!isalnum(c) && c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Called by WiFiManager when the "Setup" page is saved. All fields are validated first; if anything is
+// invalid nothing is changed.
+void on_db_params_saved() {
+    String host = String(dbHostParam.getValue());
+    String name = String(dbNameParam.getValue());
+    String table = String(dbTableParam.getValue());
+    String user = String(dbUserParam.getValue());
+    String pass = String(dbPassParam.getValue());   // empty = keep the current password
+    host.trim();
+    name.trim();
+    table.trim();
+    user.trim();
+    long port = String(dbPortParam.getValue()).toInt();
+
+    if (!is_valid_host(host) || port < 1 || port > 65535 ||
+        !is_valid_identifier(name) || !is_valid_identifier(table) ||
+        user.length() == 0 || user.length() > DB_USER_MAX_LEN || pass.length() > DB_PASS_MAX_LEN) {
+        send_message("Invalid database settings, nothing changed.");
+        update_db_params();   // show the stored values again
+        return;
+    }
+
+    host.toCharArray(dbHost, sizeof(dbHost));
+    dbPort = (uint16_t)port;
+    name.toCharArray(dbName, sizeof(dbName));
+    table.toCharArray(dbTable, sizeof(dbTable));
+    user.toCharArray(dbUser, sizeof(dbUser));
+    if (pass.length() > 0) {
+        pass.toCharArray(dbPassword, sizeof(dbPassword));
+    }
+
+    Preferences prefs;
+    prefs.begin(DB_CFG_NAMESPACE, false);
+    prefs.putString("host", dbHost);
+    prefs.putUShort("port", dbPort);
+    prefs.putString("db", dbName);
+    prefs.putString("table", dbTable);
+    prefs.putString("user", dbUser);
+    prefs.putString("pass", dbPassword);
+    prefs.end();
+
+    update_db_params();
+    send_message("Database settings saved: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) +
+                 " -> " + String(dbName) + "." + String(dbTable));
+}
+
+/******************************************************************
  *     Wi-Fi
 ******************************************************************/
 
@@ -257,7 +411,27 @@ void on_config_portal_started(WiFiManager *wm) {
     send_message("Config portal started: " + String(WIFI_PORTAL_SSID));
 }
 
-void connect_wifi() {
+// Double reset detection. A flag in flash means "the previous boot happened less than DRD_WINDOW_MS ago".
+// RTC memory can't be used for this: on the ESP32 the RST/EN button power-cycles the whole chip.
+// Costs DRD_WINDOW_MS of boot time (the IAQ LEDs are lit during it = "press RST again now").
+bool check_double_reset() {
+    Preferences prefs;
+    prefs.begin(DRD_NAMESPACE, false);
+
+    if (prefs.getBool(DRD_KEY, false)) {
+        prefs.putBool(DRD_KEY, false);
+        prefs.end();
+        return true;
+    }
+
+    prefs.putBool(DRD_KEY, true);
+    delay(DRD_WINDOW_MS);   // a reset during this delay boots with the flag still set
+    prefs.putBool(DRD_KEY, false);
+    prefs.end();
+    return false;
+}
+
+void connect_wifi(bool forcePortal) {
     WiFi.mode(WIFI_STA);
 
     wifiManager.setDebugOutput(DEBUG_MODE);
@@ -269,10 +443,39 @@ void connect_wifi() {
     wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_S);
     wifiManager.setConnectRetries(WIFI_CONNECT_RETRIES);
     wifiManager.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_S);
+    wifiManager.setAPClientCheck(true);   // keep the portal open while a phone is connected to it
     wifiManager.setAPCallback(on_config_portal_started);
 
-    blink_blue_led(true);
-    if (!wifiManager.autoConnect(WIFI_PORTAL_SSID)) {
+    // Database server fields on a separate "Setup" page, so the address can be changed without
+    // re-entering the Wi-Fi password
+    wifiManager.addParameter(&dbHostParam);
+    wifiManager.addParameter(&dbPortParam);
+    wifiManager.addParameter(&dbNameParam);
+    wifiManager.addParameter(&dbTableParam);
+    wifiManager.addParameter(&dbUserParam);
+    wifiManager.addParameter(&dbPassParam);
+    wifiManager.setSaveParamsCallback(on_db_params_saved);
+    std::vector<const char *> menu = {"wifi", "param", "info", "exit", "sep", "update"};
+    wifiManager.setMenu(menu);
+
+    bool connected = false;
+    if (forcePortal) {
+        // On-demand reconfiguration (double reset): portal first, saved network untouched until new
+        // credentials are saved. On timeout fall through to the normal saved-network connect.
+        send_message("Double reset detected. Opening config portal.");
+        connected = wifiManager.startConfigPortal(WIFI_PORTAL_SSID, portalPassword);
+        if (!connected) {
+            send_message("Portal closed without new settings. Using the saved network.");
+            set_blue_led(false);
+            set_iaq_leds(true, true, true, true);
+        }
+    }
+
+    if (!connected) {
+        blink_blue_led(true);
+        connected = wifiManager.autoConnect(WIFI_PORTAL_SSID, portalPassword);
+    }
+    if (!connected) {
         send_message("No Wi-Fi and portal timed out. Restarting...");
         delay(1000);
         ESP.restart();
@@ -338,8 +541,8 @@ bool ensure_db_connected() {
     dbAttempted = true;
     lastDbAttempt = millis();
 
-    send_message("Database connecting...");
-    if (conn.connect(server_addr, DB_PORT, db_user, db_password)) {
+    send_message("Database connecting to " + String(dbHost) + ":" + String(dbPort) + "...");
+    if (conn.connect(dbHost, dbPort, dbUser, dbPassword)) {
         send_message("Database connected.");
         return true;
     }
@@ -357,10 +560,11 @@ bool send_to_db() {
         return false;
     }
 
-    char query[192];
+    // dbName / dbTable are validated to [A-Za-z0-9_] when saved, so they are safe to put into the SQL text
+    char query[320];
     snprintf(query, sizeof(query),
-             "INSERT INTO myroom.sensor_data (temperature, humidity, iaq, iaq_accuracy) VALUES (%.2f, %.2f, %.2f, %u)",
-             temp, hum, iaq, (unsigned)iaq_accuracy);
+             "INSERT INTO `%s`.`%s` (temperature, humidity, iaq, iaq_accuracy) VALUES (%.2f, %.2f, %.2f, %u)",
+             dbName, dbTable, temp, hum, iaq, (unsigned)iaq_accuracy);
 
     MySQL_Query query_executor(&conn);
     if (query_executor.execute(query)) {
@@ -394,7 +598,10 @@ void setup() {
     // Turn on all IAQ LEDs to indicate startup
     set_iaq_leds(true, true, true, true);
 
-    connect_wifi();
+    load_db_config();
+
+    bool doubleReset = check_double_reset();
+    connect_wifi(doubleReset);
     initialize_sensor();
 
     // turn off all LEDs after successful startup
