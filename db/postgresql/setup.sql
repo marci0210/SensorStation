@@ -58,25 +58,23 @@ GRANT CONNECT ON DATABASE sensorstation TO sensor_writer, sensor_reader;
 -- ---------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS myroom;
 
+-- The measurement time is the primary key: one device writes about one row per minute, so it is unique,
+-- and the key's index also serves all time-range queries ("last 24 h"), so no extra index is needed.
 CREATE TABLE IF NOT EXISTS myroom.sensor_data (
-    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),   -- the device has no clock; the server stamps each row
-    temperature   REAL        NOT NULL,                 -- °C, heat-compensated
+    "timestamp"   TIMESTAMPTZ NOT NULL DEFAULT now() PRIMARY KEY,   -- the device has no clock; the server stamps each row
+    temperature   REAL        NOT NULL,                 -- °C, heat-compensated, temperature offset applied
     humidity      REAL        NOT NULL,                 -- % relative humidity, heat-compensated
-    iaq           REAL        NOT NULL,                 -- BSEC IAQ index
+    iaq           REAL        NOT NULL,                 -- BSEC static IAQ index (unscaled: may exceed 500)
     iaq_accuracy  SMALLINT    NOT NULL,                 -- 0 = stabilising .. 3 = calibrated
 
     CONSTRAINT sensor_data_humidity_range CHECK (humidity BETWEEN 0 AND 100),
-    CONSTRAINT sensor_data_iaq_range      CHECK (iaq BETWEEN 0 AND 500),
+    CONSTRAINT sensor_data_iaq_range      CHECK (iaq >= 0),
     CONSTRAINT sensor_data_accuracy_range CHECK (iaq_accuracy BETWEEN 0 AND 3)
 );
 
 COMMENT ON TABLE  myroom.sensor_data              IS 'BME680/BSEC readings from the SensorStation ESP32, about one row per minute';
-COMMENT ON COLUMN myroom.sensor_data.iaq          IS 'BSEC IAQ: 0-50 excellent, 51-100 good, 101-150 lightly polluted, 151-200 moderately, 201-250 heavily, 251-350 severely, >350 extremely polluted';
+COMMENT ON COLUMN myroom.sensor_data.iaq          IS 'BSEC static IAQ (unscaled, can exceed 500): 0-50 excellent, 51-100 good, 101-150 lightly polluted, 151-200 moderately, 201-250 heavily, 251-350 severely, >350 extremely polluted';
 COMMENT ON COLUMN myroom.sensor_data.iaq_accuracy IS '0 stabilising, 1 low, 2 medium, 3 high (calibrated)';
-
--- Time-range queries (dashboards, "last 24 h") are by far the most common
-CREATE INDEX IF NOT EXISTS sensor_data_created_at_idx ON myroom.sensor_data (created_at);
 
 -- ---------------------------------------------------------------------
 -- 4. Convenience views
@@ -84,11 +82,11 @@ CREATE INDEX IF NOT EXISTS sensor_data_created_at_idx ON myroom.sensor_data (cre
 CREATE OR REPLACE VIEW myroom.latest_reading AS
 SELECT *
 FROM myroom.sensor_data
-ORDER BY created_at DESC
+ORDER BY "timestamp" DESC
 LIMIT 1;
 
 CREATE OR REPLACE VIEW myroom.hourly_summary AS
-SELECT date_trunc('hour', created_at)   AS hour,
+SELECT date_trunc('hour', "timestamp")  AS hour,
        count(*)                         AS samples,
        round(avg(temperature)::numeric, 2) AS avg_temperature,
        round(avg(humidity)::numeric, 2)    AS avg_humidity,
@@ -101,7 +99,7 @@ GROUP BY 1;
 -- ---------------------------------------------------------------------
 -- 5. Privileges
 -- ---------------------------------------------------------------------
--- Device: may only insert new rows (identity columns need no extra sequence grant)
+-- Device: may only insert new rows
 GRANT USAGE  ON SCHEMA myroom             TO sensor_writer;
 GRANT INSERT ON myroom.sensor_data        TO sensor_writer;
 
@@ -113,6 +111,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA myroom GRANT SELECT ON TABLES TO sensor_reade
 -- ---------------------------------------------------------------------
 -- 6. Optional: data retention (uncomment and schedule, e.g. with cron/pg_cron)
 -- ---------------------------------------------------------------------
--- DELETE FROM myroom.sensor_data WHERE created_at < now() - interval '2 years';
+-- DELETE FROM myroom.sensor_data WHERE "timestamp" < now() - interval '2 years';
 
 \echo 'SensorStation PostgreSQL setup complete.'

@@ -33,7 +33,8 @@ pick the network.
 
 ## Features
 
-- **BSEC-based IAQ**: IAQ index (0–500), IAQ accuracy (0–3), heat-compensated temperature and humidity.
+- **BSEC-based IAQ**: static IAQ index with accuracy (0–3), plus heat-compensated temperature and humidity
+  with a configurable temperature offset for self-heating.
 - **Persistent calibration**: the BSEC calibration state is saved to flash when the IAQ accuracy improves, every 6 h
   once fully calibrated, and before any self-restart. It is restored on boot.
 - **Status LEDs**: one LED shows Wi-Fi status and four LEDs show the air-quality level.
@@ -214,6 +215,7 @@ char db_password[] = "your_db_password";
 | `DB_RECONNECT_INTERVAL_MS` | 30 s | Minimum time between DB connection attempts |
 | `NO_DATA_RESTART_MS` | 15 min | Reboot if no row has been stored for this long |
 | `STATE_SAVE_PERIOD_MS` | 6 h | Re-save the calibrated BSEC state this often |
+| `DEFAULT_TEMP_OFFSET` | `0.0` | Temperature offset until one is set in the portal |
 | `WDT_TIMEOUT_S` | `120` | Hardware watchdog: reboot if `loop()` stops running for this long |
 
 ### 3. Database settings (in the portal)
@@ -232,6 +234,7 @@ Everything about where and how readings are stored can be changed **without re-f
    | Table name | `sensor_data` | Letters, digits, `_` |
    | Database user | `sensor` | Required, max. 32 characters |
    | Database password | | **Leave empty to keep the current password.** Max. 64 characters. |
+   | Temperature offset | `2.3` | °C, −10 to +10. See [Temperature offset](#temperature-offset-calibration). |
 
 4. Tap **Exit**. The device connects to the saved Wi-Fi and uses the new settings.
 
@@ -254,19 +257,52 @@ Ready-made setup scripts are in [db/](db/):
 
 | Script | For | Status |
 |---|---|---|
-| [db/mysql/setup.sql](db/mysql/setup.sql) | MySQL / MariaDB | **Used by the current firmware** |
+| [db/mysql/setup.sql](db/mysql/setup.sql) | MySQL / MariaDB | **Used by the current firmware**. New installation. |
+| [db/mysql/migrate_v2.sql](db/mysql/migrate_v2.sql) | MySQL / MariaDB | Upgrade an existing table to the current layout |
 | [db/postgresql/setup.sql](db/postgresql/setup.sql) | PostgreSQL | Schema only. The firmware can't talk to PostgreSQL yet (see below). |
 
+### Table layout
+
+| Column | Type (MySQL / PostgreSQL) | Content |
+|---|---|---|
+| `timestamp` | `TIMESTAMP` / `TIMESTAMPTZ`, **primary key** | Measurement time, set by the database server (the device has no clock) |
+| `temperature` | `FLOAT` / `REAL` | °C, heat-compensated, temperature offset applied |
+| `humidity` | `FLOAT` / `REAL` | % relative humidity |
+| `iaq` | `FLOAT` / `REAL` | BSEC static IAQ (unscaled, so it can exceed 500) |
+| `iaq_accuracy` | `TINYINT UNSIGNED` / `SMALLINT` | 0–3 |
+
+The timestamp is the primary key, and there's no separate `id` column:
+
+- **Less storage:** this saves the `id` column and a separate index on `timestamp`.
+- **Faster time-range queries:** InnoDB stores rows ordered by the primary key.
+- **Uniqueness:** the device writes about one row per minute, so timestamps are unique.
+- **Self-healing on collision:** if two inserts ever land in the same second, the second one is rejected and simply
+  retried with the next sample.
+- **More devices later:** a single timestamp key won't work for several stations writing to one table. You would then
+  need a `device` column and a combined key `(device, timestamp)`.
+- **Quoting:** `timestamp` is also a type name, so the scripts quote it (`` `timestamp` `` in MySQL, `"timestamp"` in
+  PostgreSQL). Your own queries work without quotes in both, but quoting is the safe habit.
+- **MariaDB 2038 limit:** MariaDB before 11.5 stores `TIMESTAMP` only up to January 2038. Switching to `DATETIME` is
+  a simple change before then.
+
 ### MySQL / MariaDB (current firmware)
+
+**New installation:**
 
 ```bash
 mysql -h <nas-ip> -P 3307 -u root -p < db/mysql/setup.sql
 ```
 
-The script creates the `myroom` database, the `myroom.sensor_data` table (with an auto `id` and a server-side
-`created_at` timestamp) and an insert-only user `sensor@192.168.0.%`. Change the password in the script and put the
-same credentials in the portal's **Setup** page (or as defaults in `inc/config.hpp`). The server must accept **TCP connections from the LAN** (not just `localhost`),
-and the user must use `mysql_native_password`, which is the only authentication MySQL_MariaDB_Generic supports.
+The script creates the `myroom` database, the `myroom.sensor_data` table and an insert-only user
+`sensor@192.168.0.%`. Change the password in the script and put the same credentials in the portal's **Setup** page (or
+as defaults in `inc/config.hpp`). The server must accept **TCP connections from the LAN** (not just `localhost`), and
+the user must use `mysql_native_password`, which is the only authentication MySQL_MariaDB_Generic supports.
+
+**Existing table** (older layout with `id`, `pressure` and `gas` columns): use
+[db/mysql/migrate_v2.sql](db/mysql/migrate_v2.sql). **Back up first**, then run it **step by step**. It checks for rows
+without a timestamp and for duplicate timestamps, which both have to be resolved before `timestamp` can become the
+primary key. Then it removes `id`, `pressure` and `gas` and rebuilds the table to free the space. It's written for
+MariaDB (Synology); on MySQL, remove the `IF EXISTS` parts.
 
 ### PostgreSQL
 
@@ -278,7 +314,7 @@ The script is idempotent (safe to re-run) and must be run with `psql`. It create
 
 - database `sensorstation` with schema `myroom` and table `myroom.sensor_data`, using the same column names as the
   MySQL version, so the firmware's `INSERT` statement works unchanged,
-- range checks on humidity, IAQ and accuracy, and an index on `created_at`,
+- `timestamp` as the primary key, and range checks on humidity, IAQ (≥ 0) and accuracy,
 - the views `myroom.latest_reading` and `myroom.hourly_summary`,
 - the roles `sensor_writer` (INSERT only, for the device) and `sensor_reader` (SELECT only, e.g. for Grafana).
 
@@ -376,6 +412,7 @@ setup()
  │    └─ otherwise open portal (blue solid) for 180 s → reboot on timeout
  ├─ initialize_sensor()
  │    ├─ Wire.begin(SDA=15, SCL=0), Bsec.begin(0x76)
+ │    ├─ setConfig(generic_33v_3s_4d), setTemperatureOffset(<from flash>)
  │    ├─ loadState() → restore BSEC calibration from flash
  │    └─ subscribe to IAQ, static IAQ, CO₂-eq, bVOC-eq, raw T/H/gas,
  │       heat-compensated T/H at BSEC_SAMPLE_RATE_LP (one sample every 3 s)
@@ -385,7 +422,7 @@ loop()
  ├─ feed watchdog
  ├─ handle_wifi(): on loss → blink blue, drop DB socket, WiFi.reconnect() every 30 s
  ├─ when iaqSensor.run() returns a new sample (≈ every 3 s):
- │    ├─ read temperature, humidity, IAQ, accuracy
+ │    ├─ read temperature, humidity, static IAQ + accuracy
  │    ├─ save BSEC state if accuracy improved (or every 6 h when calibrated)
  │    └─ every 20th sample (≈ 60 s):
  │         ├─ update the IAQ colour LED
@@ -422,15 +459,64 @@ A brand-new sensor usually needs a few hours to a couple of days of continuous o
 and polluted air, before it reaches accuracy 3. The saved BSEC state, together with its accuracy, lets the device
 keep that calibration across reboots.
 
-Flash layout (emulated EEPROM, 157 bytes): byte 0 is the magic `0x77`, bytes 1–155 hold the BSEC state, and byte 156
-holds the accuracy of the stored state.
+A saved state only fits the **BSEC configuration and library version** it was created with. BSEC may still accept a
+mismatched state, and then produces nonsense, such as a static IAQ far above 500 at accuracy 2. So each save also
+stores a **fingerprint** (FNV-1a hash of the configuration and the library version). At boot, a state with a different
+fingerprint is discarded and calibration starts over. This happens automatically after a BSEC library update or a
+configuration change.
+
+Flash layout (emulated EEPROM, 161 bytes):
+
+| Bytes | Content |
+|---|---|
+| 0 | Magic `0x78` (`0x77` is the older layout without a fingerprint; it's ignored) |
+| 1–155 | BSEC state |
+| 156 | Accuracy of the stored state |
+| 157–160 | Fingerprint |
 
 ### Measured values
 
-The BSEC subscription also requests static IAQ, CO₂ equivalent, breath-VOC equivalent and raw gas resistance, but only
-**temperature, humidity, IAQ and IAQ accuracy** are stored. Pressure isn't logged. To log more values, read them
-from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEquivalent`, `iaqSensor.staticIaq`,
-`iaqSensor.pressure`) and add matching columns to the table and the `INSERT` query.
+| Stored column | Source | Notes |
+|---|---|---|
+| `temperature` | BSEC heat-compensated temperature | Corrected by the **temperature offset** (see below) |
+| `humidity` | BSEC heat-compensated relative humidity | Recalculated by BSEC at the corrected temperature |
+| `iaq` | BSEC **static IAQ** (`iaqSensor.staticIaq`) | Bosch's recommended output for stationary devices |
+| `iaq_accuracy` | Accuracy of the static IAQ (`staticIaqAccuracy`) | 0–3, see above |
+
+**BSEC configuration.** The firmware loads `generic_33v_3s_4d` from the BSEC library: 3.3 V supply, 3 s sample
+interval (LP mode, matching `BSEC_SAMPLE_RATE_LP`) and a 4-day calibration history. The configuration is loaded before
+the saved state is restored, because a state only fits the configuration it was created with. If you change it
+(e.g. to `generic_33v_3s_28d` for a steadier but slower-adapting IAQ), BSEC rejects the old state and recalibrates.
+
+**Static IAQ vs. IAQ.** The plain IAQ output keeps rescaling itself to recent conditions, which suits a device carried
+around. For a monitor that stays in one room, a room that stays stuffy for days would slowly drift back toward
+"good". Static IAQ doesn't drift like that. Both are calculated; the IAQ LEDs and the database use static IAQ.
+
+> ⚠️ Rows stored before this change hold the **plain** IAQ in the `iaq` column. Keep that in mind when comparing old
+> and new data.
+
+The BSEC subscription also provides the plain IAQ, CO₂ equivalent, breath-VOC equivalent and raw gas resistance, which
+aren't stored. Pressure isn't logged either. To log more values, read them from the `Bsec` object (e.g.
+`iaqSensor.co2Equivalent`, `iaqSensor.breathVocEquivalent`, `iaqSensor.iaq`, `iaqSensor.pressure`) and add matching
+columns to the table and the `INSERT` query.
+
+### Temperature offset (calibration)
+
+The BME680 is warmed by the ESP32 next to it and by its own electronics, so it reads **too warm**, typically by about
+1–4 °C. Because relative humidity depends on temperature, it then also reads **too low**. BSEC corrects both if it
+knows the offset:
+
+1. Run the station in its final place, with its final firmware, for **at least 1 hour** so it reaches a steady
+   temperature.
+2. Put a trusted thermometer right next to it and compare the readings once both are stable.
+3. **Offset = station reading − real temperature.** For example, the station shows 24.6 °C and the thermometer
+   shows 22.3 °C, so the offset is `2.3`.
+4. Open the portal (RST twice), go to **Setup**, enter the offset in **Temperature offset** and save. Allowed range:
+   −10 to +10 °C.
+
+The offset is stored in flash (namespace `sensor`) and applied from the next sensor start, which is right after the
+portal closes. Humidity corrects itself. Keeping the sensor 5–10 cm away from the ESP32 (on a short cable) makes the
+offset smaller and more stable. Re-check the offset if you move the station or change its enclosure.
 
 ---
 
@@ -446,6 +532,7 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
 │   └── config.hpp            # Portal password + default DB credentials (optional, git-ignored)
 ├── db/
 │   ├── mysql/setup.sql       # MySQL/MariaDB schema + device user (used by the firmware)
+│   ├── mysql/migrate_v2.sql  # Upgrade an existing table (drop id/pressure/gas, timestamp as key)
 │   └── postgresql/setup.sql  # PostgreSQL schema, views and roles
 ├── docs/
 │   └── schematic.svg         # Wiring schematic
@@ -461,6 +548,7 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
 | Build warning `PORTAL_PASSWORD not defined` | Add `#define PORTAL_PASSWORD "..."` to `inc/config.hpp` (see [Configuration](#1-local-secrets-incconfighpp-optional-not-in-git)). |
 | Can't connect to `ESP_SensorKit` | Since `PORTAL_PASSWORD` was added, the network asks for that password. |
 | Nothing on the serial monitor | `DEBUG_MODE` is `false` by default. Set it to `true` and re-flash. The first line printed is the reset reason, which helps tell a watchdog reboot from a power cut. |
+| Static IAQ far above 500 although accuracy is 2–3 | The restored calibration doesn't fit the current BSEC configuration. Firmware from this version on detects this and recalibrates automatically. If it still happens after a fresh calibration, check the raw gas resistance with `DEBUG_MODE` (typically tens to hundreds of kΩ; very low values mean solvents or alcohol near the sensor). |
 | IAQ stays at 25 and accuracy stays at 0 | Normal during the first few minutes or hours (BSEC run-in). Leave it running. |
 | No sensor data at all | Check the wiring and I²C address (`0x76` vs `0x77`). Make sure the BME680 runs on 3.3 V. |
 | Board doesn't boot / hangs at reset | Something may be pulling GPIO 0 or GPIO 15 low (strapping pins). Disconnect the sensor and check, or move I²C to other pins. |
@@ -483,7 +571,7 @@ from the `Bsec` object (e.g. `iaqSensor.co2Equivalent`, `iaqSensor.breathVocEqui
   path, either a TLS-capable client or an HTTPS ingest service in front of the database.
 - **MySQL only**: the firmware uses the MySQL protocol. The PostgreSQL script is ready, but the firmware's database
   code has to be ported before it can use it.
-- **No clock on the device**: there is no RTC/NTP, so timestamps come from the database (`created_at`).
+- **No clock on the device**: there is no RTC/NTP, so timestamps come from the database (`timestamp` column).
 - **Blocking DB connect**: a connection attempt to an unreachable server can block `loop()` for up to about 50 s
   (library retries). BSEC then reports a timing warning for that cycle, which is harmless. The watchdog timeout
   (120 s) allows for this.

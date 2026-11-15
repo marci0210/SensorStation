@@ -57,6 +57,13 @@
 #define DB_IDENT_MAX_LEN            64                // database / table name (MySQL limit)
 #define DB_CFG_NAMESPACE            "dbcfg"
 
+// Sensor calibration: temperature offset = station reading - real temperature (self-heating of the board).
+// Set in the portal ("Setup" page) and kept in flash; BSEC also corrects the humidity with it.
+#define DEFAULT_TEMP_OFFSET         0.0f
+#define TEMP_OFFSET_MIN             (-10.0f)
+#define TEMP_OFFSET_MAX             10.0f
+#define SENSOR_CFG_NAMESPACE        "sensor"
+
 // Timing
 #define SEND_EVERY_N_SAMPLES        20u                              // 20 x 3 s (BSEC LP rate) ~= 60 s
 #define WIFI_RECONNECT_INTERVAL_MS  (30UL * 1000UL)                  // nudge Wi-Fi every 30 s while offline
@@ -80,17 +87,27 @@
 // Hardware watchdog: reboots if loop() stops running (a DB connect can block for ~50 s)
 #define WDT_TIMEOUT_S               120
 
-// EEPROM layout: [0] magic, [1 .. BLOB] BSEC state, [BLOB + 1] IAQ accuracy of the stored state
-#define STATE_MAGIC                 0x77
+// EEPROM layout (v2): [0] magic, [1 .. BLOB] BSEC state, [BLOB + 1] IAQ accuracy of the stored state,
+// [BLOB + 2 .. BLOB + 5] fingerprint of the BSEC configuration + library version the state belongs to
+#define STATE_MAGIC                 0x78    // v2 (with fingerprint)
+#define STATE_MAGIC_V1              0x77    // v1 (no fingerprint): ignored, forces one new calibration
 #define STATE_ACCURACY_ADDR         (BSEC_MAX_STATE_BLOB_SIZE + 1)
-#define EEPROM_SIZE                 (BSEC_MAX_STATE_BLOB_SIZE + 2)
+#define STATE_FINGERPRINT_ADDR      (BSEC_MAX_STATE_BLOB_SIZE + 2)
+#define EEPROM_SIZE                 (BSEC_MAX_STATE_BLOB_SIZE + 6)
 
 /******************************************************************
  *     Variables
 ******************************************************************/
 
 Bsec iaqSensor;
+// BSEC configuration matching this hardware/firmware: 3.3 V supply, 3 s sample interval (LP mode),
+// 4-day calibration history. Must match BSEC_SAMPLE_RATE_LP used in updateSubscription().
+const uint8_t bsecConfig[] = {
+#include "config/generic_33v_3s_4d/bsec_iaq.txt"
+};
 uint8_t bsecState[BSEC_MAX_STATE_BLOB_SIZE] = {0};
+uint32_t bsecFingerprint = 0u;   // identifies bsecConfig + BSEC library version (see compute_bsec_fingerprint)
+float tempOffset = DEFAULT_TEMP_OFFSET;
 uint8_t savedAccuracy = 0u;      // IAQ accuracy of the state currently stored in flash
 uint32_t lastStateSave = 0u;
 
@@ -113,6 +130,8 @@ WiFiManagerParameter dbTableParam("db_table", "Table name", "", DB_IDENT_MAX_LEN
 WiFiManagerParameter dbUserParam("db_user", "Database user", "", DB_USER_MAX_LEN, "autocomplete='off'");
 WiFiManagerParameter dbPassParam("db_pass", "Database password (leave empty to keep the current one)", "", DB_PASS_MAX_LEN,
                                  "type='password' autocomplete='new-password'");
+WiFiManagerParameter tempOffsetParam("temp_offset", "Temperature offset in °C (station reading minus real temperature)", "", 6,
+                                     "type='number' step='0.1' min='-10' max='10'");
 
 MySQL_Connection conn((Client *)&client);   // `client` is the WiFiClient declared by MySQL_Generic
 
@@ -125,8 +144,8 @@ bool wifiWasConnected = false;
 
 float temp; // °C
 float hum;  // %
-float iaq;   // IAQ
-uint8_t iaq_accuracy; // IAQ Accuracy of the current sample
+float iaq;   // static IAQ (Bosch's recommendation for stationary devices)
+uint8_t iaq_accuracy; // static IAQ accuracy of the current sample
 uint8_t iaq_color_state = 100u;
 
 /******************************************************************
@@ -204,9 +223,35 @@ void update_iaq_leds() {
  *     BSEC state (calibration) persistence
 ******************************************************************/
 
+// FNV-1a hash of the BSEC configuration blob and the BSEC library version. A saved state is only valid for
+// the configuration and library it was created with; BSEC itself may accept a mismatched state and then
+// produce nonsense (e.g. static IAQ far above 500 with accuracy 2), so it is checked here.
+uint32_t compute_bsec_fingerprint() {
+    uint32_t hash = 2166136261u;
+    auto mix = [&hash](uint8_t b) {
+        hash ^= b;
+        hash *= 16777619u;
+    };
+    for (size_t i = 0; i < sizeof(bsecConfig); i++) {
+        mix(bsecConfig[i]);
+    }
+    mix(iaqSensor.version.major);
+    mix(iaqSensor.version.minor);
+    mix(iaqSensor.version.major_bugfix);
+    mix(iaqSensor.version.minor_bugfix);
+    return hash;
+}
+
 void loadState() {
     EEPROM.begin(EEPROM_SIZE);
-    if (EEPROM.read(0) == STATE_MAGIC) {
+    uint8_t magic = EEPROM.read(0);
+    uint32_t storedFingerprint = 0u;
+    EEPROM.get(STATE_FINGERPRINT_ADDR, storedFingerprint);
+
+    if (magic == STATE_MAGIC_V1 || (magic == STATE_MAGIC && storedFingerprint != bsecFingerprint)) {
+        send_message("Saved BSEC state was made with another BSEC configuration/version. Starting a new calibration.");
+    }
+    else if (magic == STATE_MAGIC) {
         for (uint16_t i = 0u; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
             bsecState[i] = EEPROM.read(i + 1);
         }
@@ -237,6 +282,7 @@ void saveState() {
         EEPROM.write(i + 1, bsecState[i]);
     }
     EEPROM.write(STATE_ACCURACY_ADDR, iaqSensor.iaqAccuracy);
+    EEPROM.put(STATE_FINGERPRINT_ADDR, bsecFingerprint);
     EEPROM.commit();
     EEPROM.end();
 
@@ -276,6 +322,18 @@ void initialize_sensor() {
     send_message("BSEC version " + String(iaqSensor.version.major) + "." + String(iaqSensor.version.minor) + "." +
                  String(iaqSensor.version.major_bugfix) + "." + String(iaqSensor.version.minor_bugfix));
 
+    // Order matters: configuration first, then the saved state (it belongs to this configuration),
+    // then the subscription.
+    iaqSensor.setConfig(bsecConfig);
+    if (iaqSensor.bsecStatus < BSEC_OK) {
+        send_message("BSEC setConfig failed: " + String((int)iaqSensor.bsecStatus));
+    }
+    bsecFingerprint = compute_bsec_fingerprint();   // needs the version, which begin() reads
+
+    // Compensate the self-heating of the board; BSEC applies it to temperature and humidity
+    iaqSensor.setTemperatureOffset(tempOffset);
+    send_message("Temperature offset: " + String(tempOffset, 1) + " C");
+
     loadState();
 
     bsec_virtual_sensor_t sensorList[] = {
@@ -294,22 +352,26 @@ void initialize_sensor() {
 }
 
 /******************************************************************
- *     Database settings (configurable in the portal)
+ *     Settings (database + sensor calibration, configurable in the portal)
 ******************************************************************/
 
 // Copy the current values into the portal form fields (never the password)
-void update_db_params() {
+void update_setup_params() {
     char portStr[6];
     snprintf(portStr, sizeof(portStr), "%u", (unsigned)dbPort);
+    char offsetStr[8];
+    snprintf(offsetStr, sizeof(offsetStr), "%.1f", tempOffset);
+
     dbHostParam.setValue(dbHost, DB_HOST_MAX_LEN);
     dbPortParam.setValue(portStr, 5);
     dbNameParam.setValue(dbName, DB_IDENT_MAX_LEN);
     dbTableParam.setValue(dbTable, DB_IDENT_MAX_LEN);
     dbUserParam.setValue(dbUser, DB_USER_MAX_LEN);
     dbPassParam.setValue("", DB_PASS_MAX_LEN);
+    tempOffsetParam.setValue(offsetStr, 6);
 }
 
-void load_db_config() {
+void load_settings() {
     Preferences prefs;
     prefs.begin(DB_CFG_NAMESPACE, false);
     prefs.getString("host", DEFAULT_DB_HOST).toCharArray(dbHost, sizeof(dbHost));
@@ -320,9 +382,30 @@ void load_db_config() {
     prefs.getString("pass", DEFAULT_DB_PASSWORD).toCharArray(dbPassword, sizeof(dbPassword));
     prefs.end();
 
-    update_db_params();
+    prefs.begin(SENSOR_CFG_NAMESPACE, false);
+    tempOffset = prefs.getFloat("toffset", DEFAULT_TEMP_OFFSET);
+    prefs.end();
+
+    update_setup_params();
     send_message("Database: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) + " -> " +
                  String(dbName) + "." + String(dbTable));
+}
+
+// Temperature offset in °C, e.g. "2.3" or "-0.5" (a decimal comma is accepted too)
+bool parse_temp_offset(const String &text, float &out) {
+    String s = text;
+    s.trim();
+    s.replace(',', '.');
+    if (s.length() == 0) {
+        return false;
+    }
+    char *end = NULL;
+    float value = strtof(s.c_str(), &end);
+    if (end == s.c_str() || *end != '\0' || isnan(value) || value < TEMP_OFFSET_MIN || value > TEMP_OFFSET_MAX) {
+        return false;
+    }
+    out = value;
+    return true;
 }
 
 // Host name or IPv4 address: letters, digits, '.', '-'
@@ -355,7 +438,7 @@ bool is_valid_identifier(const String &name) {
 
 // Called by WiFiManager when the "Setup" page is saved. All fields are validated first; if anything is
 // invalid nothing is changed.
-void on_db_params_saved() {
+void on_setup_saved() {
     String host = String(dbHostParam.getValue());
     String name = String(dbNameParam.getValue());
     String table = String(dbTableParam.getValue());
@@ -366,12 +449,14 @@ void on_db_params_saved() {
     table.trim();
     user.trim();
     long port = String(dbPortParam.getValue()).toInt();
+    float offset = 0.0f;
 
     if (!is_valid_host(host) || port < 1 || port > 65535 ||
         !is_valid_identifier(name) || !is_valid_identifier(table) ||
-        user.length() == 0 || user.length() > DB_USER_MAX_LEN || pass.length() > DB_PASS_MAX_LEN) {
-        send_message("Invalid database settings, nothing changed.");
-        update_db_params();   // show the stored values again
+        user.length() == 0 || user.length() > DB_USER_MAX_LEN || pass.length() > DB_PASS_MAX_LEN ||
+        !parse_temp_offset(String(tempOffsetParam.getValue()), offset)) {
+        send_message("Invalid settings, nothing changed.");
+        update_setup_params();   // show the stored values again
         return;
     }
 
@@ -394,9 +479,15 @@ void on_db_params_saved() {
     prefs.putString("pass", dbPassword);
     prefs.end();
 
-    update_db_params();
-    send_message("Database settings saved: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) +
-                 " -> " + String(dbName) + "." + String(dbTable));
+    // The sensor is initialised after the portal closes, so the new offset takes effect right away
+    tempOffset = offset;
+    prefs.begin(SENSOR_CFG_NAMESPACE, false);
+    prefs.putFloat("toffset", tempOffset);
+    prefs.end();
+
+    update_setup_params();
+    send_message("Settings saved: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) +
+                 " -> " + String(dbName) + "." + String(dbTable) + ", temperature offset " + String(tempOffset, 1) + " C");
 }
 
 /******************************************************************
@@ -454,7 +545,8 @@ void connect_wifi(bool forcePortal) {
     wifiManager.addParameter(&dbTableParam);
     wifiManager.addParameter(&dbUserParam);
     wifiManager.addParameter(&dbPassParam);
-    wifiManager.setSaveParamsCallback(on_db_params_saved);
+    wifiManager.addParameter(&tempOffsetParam);
+    wifiManager.setSaveParamsCallback(on_setup_saved);
     std::vector<const char *> menu = {"wifi", "param", "info", "exit", "sep", "update"};
     wifiManager.setMenu(menu);
 
@@ -598,7 +690,7 @@ void setup() {
     // Turn on all IAQ LEDs to indicate startup
     set_iaq_leds(true, true, true, true);
 
-    load_db_config();
+    load_settings();
 
     bool doubleReset = check_double_reset();
     connect_wifi(doubleReset);
@@ -625,11 +717,17 @@ void loop() {
         // Read sensor datas
         temp = iaqSensor.temperature;
         hum = iaqSensor.humidity;
-        iaq = iaqSensor.iaq;
-        iaq_accuracy = iaqSensor.iaqAccuracy;
+        // Static IAQ: Bosch's recommended output for stationary devices. The plain IAQ output keeps
+        // rescaling itself to recent conditions (meant for portable devices), so a room that stays
+        // stuffy for days would slowly drift back towards "good".
+        iaq = iaqSensor.staticIaq;
+        iaq_accuracy = iaqSensor.staticIaqAccuracy;
 
         maybe_save_state();
-        send_message("Sensor data read. Counter state: " + String(sampleCounter));
+        send_message("#" + String(sampleCounter) + " T=" + String(temp, 2) + " H=" + String(hum, 2) +
+                     " sIAQ=" + String(iaq, 1) + " (acc " + String(iaq_accuracy) + ")" +
+                     " IAQ=" + String(iaqSensor.iaq, 1) + " (acc " + String(iaqSensor.iaqAccuracy) + ")" +
+                     " gas=" + String(iaqSensor.gasResistance / 1000.0f, 1) + " kOhm");
 
         // Send data every SEND_EVERY_N_SAMPLES samples; on failure retry with the next sample
         if (sampleCounter >= SEND_EVERY_N_SAMPLES) {
