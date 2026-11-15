@@ -5,20 +5,16 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 
-#include <MySQL_Generic.h>
-
 #include <bsec.h>
 #include <EEPROM.h>
 
-// Optional, git-ignored local settings: default DB credentials and the portal's Wi-Fi password.
-//   char db_user[] = "...";  char db_password[] = "...";  #define PORTAL_PASSWORD "..."
+#include "log.hpp"
+#include "ingest.hpp"
+
+// Optional, git-ignored local settings: the portal's Wi-Fi password and the default ingest server.
+//   #define PORTAL_PASSWORD "..."   #define INGEST_DEFAULT_HOST "..."   #define INGEST_DEFAULT_PORT 8443
 #if __has_include("config.hpp")
     #include "config.hpp"
-    #define DEFAULT_DB_USER         db_user
-    #define DEFAULT_DB_PASSWORD     db_password
-#else
-    #define DEFAULT_DB_USER         ""
-    #define DEFAULT_DB_PASSWORD     ""
 #endif
 
 #ifdef PORTAL_PASSWORD
@@ -26,7 +22,7 @@
                   "PORTAL_PASSWORD must be 8..63 characters (WPA2)");
     static const char *portalPassword = PORTAL_PASSWORD;
 #else
-    #warning "PORTAL_PASSWORD not defined in config.hpp: the setup portal is an OPEN network and DB credentials typed into it are sent unencrypted"
+    #warning "PORTAL_PASSWORD not defined in config.hpp: the setup portal is an OPEN network"
     static const char *portalPassword = NULL;
 #endif
 
@@ -34,7 +30,6 @@
  *     Defines
 ******************************************************************/
 
-#define DEBUG_MODE false
 #define BME680_I2C_ADDR 0x76 // I2C address for your sensor (0x76 or 0x77)
 
 #define SDA_PIN 15
@@ -46,16 +41,23 @@
 #define YELLOW_LED_PIN 33
 #define RED_LED_PIN 32
 
-// Database: defaults only. The real values are set in the Wi-Fi portal ("Setup" page) and kept in flash.
-#define DEFAULT_DB_HOST             "192.168.0.151"   // NAS
-#define DEFAULT_DB_PORT             3307
-#define DEFAULT_DB_NAME             "myroom"
-#define DEFAULT_DB_TABLE            "sensor_data"
-#define DB_HOST_MAX_LEN             64
-#define DB_USER_MAX_LEN             32
-#define DB_PASS_MAX_LEN             64
-#define DB_IDENT_MAX_LEN            64                // database / table name (MySQL limit)
-#define DB_CFG_NAMESPACE            "dbcfg"
+// Persoboard ingest server: defaults only. The real values are set in the Wi-Fi portal ("Setup" page) and
+// kept in flash. Local: the PC's IP address or name, port 8443; OpenShift: the ingest Route host, port 443.
+// The certificate name is a DNS name from the server certificate; it's needed when connecting by IP address,
+// because the TLS library can't match IP addresses (empty = check against the server address).
+// The API path is INGEST_PATH in ingest.hpp.
+#ifndef INGEST_DEFAULT_HOST
+    #define INGEST_DEFAULT_HOST     ""
+#endif
+#ifndef INGEST_DEFAULT_CERT_NAME
+    #define INGEST_DEFAULT_CERT_NAME ""
+#endif
+#ifndef INGEST_DEFAULT_PORT
+    #define INGEST_DEFAULT_PORT     8443
+#endif
+#define INGEST_HOST_MAX_LEN         128
+#define INGEST_CFG_NAMESPACE        "ingest"
+#define LEGACY_DB_CFG_NAMESPACE     "dbcfg"           // MySQL settings of older firmware; wiped at boot
 
 // Sensor calibration: temperature offset = station reading - real temperature (self-heating of the board).
 // Set in the portal ("Setup" page) and kept in flash; BSEC also corrects the humidity with it.
@@ -65,10 +67,10 @@
 #define SENSOR_CFG_NAMESPACE        "sensor"
 
 // Timing
-#define SEND_EVERY_N_SAMPLES        20u                              // 20 x 3 s (BSEC LP rate) ~= 60 s
+#define READING_INTERVAL_MS         (60UL * 1000UL)                  // one reading per minute (BSEC samples every 3 s)
 #define WIFI_RECONNECT_INTERVAL_MS  (30UL * 1000UL)                  // nudge Wi-Fi every 30 s while offline
-#define DB_RECONNECT_INTERVAL_MS    (30UL * 1000UL)                  // min. time between DB connect attempts
-#define NO_DATA_RESTART_MS          (15UL * 60UL * 1000UL)           // reboot if nothing was stored for 15 min
+#define WIFI_LOST_RESTART_MS        (15UL * 60UL * 1000UL)           // reboot if Wi-Fi stays down for 15 min
+#define NO_RESPONSE_RESTART_MS      (60UL * 60UL * 1000UL)           // reboot if the server hasn't answered for 1 h
 #define STATE_SAVE_PERIOD_MS        (6UL * 60UL * 60UL * 1000UL)     // re-save calibrated BSEC state every 6 h
 #define BLINK_INTERVAL_MS           500u
 
@@ -84,8 +86,8 @@
 #define DRD_NAMESPACE               "drd"
 #define DRD_KEY                     "pending"
 
-// Hardware watchdog: reboots if loop() stops running (a DB connect can block for ~50 s)
-#define WDT_TIMEOUT_S               120
+// Task watchdog: reboots if loop() or the upload task stops running (an HTTPS request takes at most ~30 s)
+#define WDT_TIMEOUT_S               60
 
 // EEPROM layout (v2): [0] magic, [1 .. BLOB] BSEC state, [BLOB + 1] IAQ accuracy of the stored state,
 // [BLOB + 2 .. BLOB + 5] fingerprint of the BSEC configuration + library version the state belongs to
@@ -115,54 +117,31 @@ WiFiManager wifiManager;
 Ticker blueBlinker;
 volatile bool blueLedState = false;
 
-char dbHost[DB_HOST_MAX_LEN + 1] = DEFAULT_DB_HOST;   // IP address or host name
-uint16_t dbPort = DEFAULT_DB_PORT;
-char dbName[DB_IDENT_MAX_LEN + 1] = DEFAULT_DB_NAME;
-char dbTable[DB_IDENT_MAX_LEN + 1] = DEFAULT_DB_TABLE;
-char dbUser[DB_USER_MAX_LEN + 1] = "";
-char dbPassword[DB_PASS_MAX_LEN + 1] = "";
+char ingestHost[INGEST_HOST_MAX_LEN + 1] = INGEST_DEFAULT_HOST;            // where to connect: IP or host name
+uint16_t ingestPort = INGEST_DEFAULT_PORT;
+char ingestCertName[INGEST_HOST_MAX_LEN + 1] = INGEST_DEFAULT_CERT_NAME;   // empty = same as ingestHost
 
-// Portal "Setup" page fields. The password field is never pre-filled: empty = keep the current password.
-WiFiManagerParameter dbHostParam("db_host", "Database server (IP address or host name)", "", DB_HOST_MAX_LEN);
-WiFiManagerParameter dbPortParam("db_port", "Database port", "", 5, "type='number' min='1' max='65535'");
-WiFiManagerParameter dbNameParam("db_name", "Database name", "", DB_IDENT_MAX_LEN);
-WiFiManagerParameter dbTableParam("db_table", "Table name", "", DB_IDENT_MAX_LEN);
-WiFiManagerParameter dbUserParam("db_user", "Database user", "", DB_USER_MAX_LEN, "autocomplete='off'");
-WiFiManagerParameter dbPassParam("db_pass", "Database password (leave empty to keep the current one)", "", DB_PASS_MAX_LEN,
-                                 "type='password' autocomplete='new-password'");
+// Portal "Setup" page fields
+WiFiManagerParameter ingestHostParam("pb_host", "Ingest server (IP address or host name)", "", INGEST_HOST_MAX_LEN);
+WiFiManagerParameter ingestPortParam("pb_port", "Ingest server port (8443 local, 443 OpenShift)", "", 5,
+                                     "type='number' min='1' max='65535'");
+WiFiManagerParameter ingestCertNameParam("pb_cert_name",
+                                         "Certificate name (a DNS name in the server certificate; required when the "
+                                         "server is an IP address, otherwise leave empty)", "", INGEST_HOST_MAX_LEN);
 WiFiManagerParameter tempOffsetParam("temp_offset", "Temperature offset in °C (station reading minus real temperature)", "", 6,
                                      "type='number' step='0.1' min='-10' max='10'");
 
-MySQL_Connection conn((Client *)&client);   // `client` is the WiFiClient declared by MySQL_Generic
-
 uint32_t sampleCounter = 0u;
-uint32_t lastSuccessfulSend = 0u;
+uint32_t nextReadingMs = 0u;
 uint32_t lastWifiAttempt = 0u;
-uint32_t lastDbAttempt = 0u;
-bool dbAttempted = false;
+uint32_t wifiLostSince = 0u;
 bool wifiWasConnected = false;
 
 float temp; // °C
 float hum;  // %
-float iaq;   // static IAQ (Bosch's recommendation for stationary devices)
-uint8_t iaq_accuracy; // static IAQ accuracy of the current sample
+float iaq;   // BSEC IAQ (BSEC_OUTPUT_IAQ), as the Persoboard contract requires
+uint8_t iaq_accuracy; // accuracy of that IAQ value
 uint8_t iaq_color_state = 100u;
-
-/******************************************************************
- *     Helpers
-******************************************************************/
-
-void send_message(const char* msg) {
-    if (DEBUG_MODE) {
-        Serial.println(msg);
-    }
-}
-
-void send_message(String msg) {
-    if (DEBUG_MODE) {
-        Serial.println(msg);
-    }
-}
 
 /******************************************************************
  *     LEDs
@@ -304,6 +283,7 @@ void maybe_save_state() {
 // Reboot, but keep the latest calibration if it is at least as good as the stored one.
 void safe_restart(const char* reason) {
     send_message(reason);
+    ingest::prepare_for_restart();   // unsent readings get their timestamps and survive the reboot
     if (iaqSensor.iaqAccuracy > 0u && iaqSensor.iaqAccuracy >= savedAccuracy) {
         saveState();
     }
@@ -352,34 +332,28 @@ void initialize_sensor() {
 }
 
 /******************************************************************
- *     Settings (database + sensor calibration, configurable in the portal)
+ *     Settings (ingest server + sensor calibration, configurable in the portal)
 ******************************************************************/
 
-// Copy the current values into the portal form fields (never the password)
+// Copy the current values into the portal form fields
 void update_setup_params() {
     char portStr[6];
-    snprintf(portStr, sizeof(portStr), "%u", (unsigned)dbPort);
+    snprintf(portStr, sizeof(portStr), "%u", (unsigned)ingestPort);
     char offsetStr[8];
     snprintf(offsetStr, sizeof(offsetStr), "%.1f", tempOffset);
 
-    dbHostParam.setValue(dbHost, DB_HOST_MAX_LEN);
-    dbPortParam.setValue(portStr, 5);
-    dbNameParam.setValue(dbName, DB_IDENT_MAX_LEN);
-    dbTableParam.setValue(dbTable, DB_IDENT_MAX_LEN);
-    dbUserParam.setValue(dbUser, DB_USER_MAX_LEN);
-    dbPassParam.setValue("", DB_PASS_MAX_LEN);
+    ingestHostParam.setValue(ingestHost, INGEST_HOST_MAX_LEN);
+    ingestPortParam.setValue(portStr, 5);
+    ingestCertNameParam.setValue(ingestCertName, INGEST_HOST_MAX_LEN);
     tempOffsetParam.setValue(offsetStr, 6);
 }
 
 void load_settings() {
     Preferences prefs;
-    prefs.begin(DB_CFG_NAMESPACE, false);
-    prefs.getString("host", DEFAULT_DB_HOST).toCharArray(dbHost, sizeof(dbHost));
-    dbPort = prefs.getUShort("port", DEFAULT_DB_PORT);
-    prefs.getString("db", DEFAULT_DB_NAME).toCharArray(dbName, sizeof(dbName));
-    prefs.getString("table", DEFAULT_DB_TABLE).toCharArray(dbTable, sizeof(dbTable));
-    prefs.getString("user", DEFAULT_DB_USER).toCharArray(dbUser, sizeof(dbUser));
-    prefs.getString("pass", DEFAULT_DB_PASSWORD).toCharArray(dbPassword, sizeof(dbPassword));
+    prefs.begin(INGEST_CFG_NAMESPACE, false);
+    prefs.getString("host", INGEST_DEFAULT_HOST).toCharArray(ingestHost, sizeof(ingestHost));
+    ingestPort = prefs.getUShort("port", INGEST_DEFAULT_PORT);
+    prefs.getString("certname", INGEST_DEFAULT_CERT_NAME).toCharArray(ingestCertName, sizeof(ingestCertName));
     prefs.end();
 
     prefs.begin(SENSOR_CFG_NAMESPACE, false);
@@ -387,8 +361,24 @@ void load_settings() {
     prefs.end();
 
     update_setup_params();
-    send_message("Database: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) + " -> " +
-                 String(dbName) + "." + String(dbTable));
+    send_message("Ingest server: " + String(ingestHost[0] ? ingestHost : "(not set)") + ":" + String(ingestPort) +
+                 (ingestCertName[0] ? ", certificate name " + String(ingestCertName) : String("")));
+}
+
+// Older firmware kept the MySQL settings, including the password in plain text, in flash. They are no
+// longer used, so remove them.
+void forget_legacy_db_settings() {
+    Preferences prefs;
+    if (!prefs.begin(LEGACY_DB_CFG_NAMESPACE, true)) {
+        return;   // namespace doesn't exist
+    }
+    bool present = prefs.isKey("host") || prefs.isKey("user") || prefs.isKey("pass");
+    prefs.end();
+    if (present && prefs.begin(LEGACY_DB_CFG_NAMESPACE, false)) {
+        prefs.clear();
+        prefs.end();
+        send_message("Old database settings removed from flash.");
+    }
 }
 
 // Temperature offset in °C, e.g. "2.3" or "-0.5" (a decimal comma is accepted too)
@@ -410,7 +400,7 @@ bool parse_temp_offset(const String &text, float &out) {
 
 // Host name or IPv4 address: letters, digits, '.', '-'
 bool is_valid_host(const String &host) {
-    if (host.length() == 0 || host.length() > DB_HOST_MAX_LEN) {
+    if (host.length() == 0 || host.length() > INGEST_HOST_MAX_LEN) {
         return false;
     }
     for (size_t i = 0; i < host.length(); i++) {
@@ -422,61 +412,33 @@ bool is_valid_host(const String &host) {
     return true;
 }
 
-// Database / table name. Restricted to letters, digits and '_' because it is inserted into the SQL text.
-bool is_valid_identifier(const String &name) {
-    if (name.length() == 0 || name.length() > DB_IDENT_MAX_LEN) {
-        return false;
-    }
-    for (size_t i = 0; i < name.length(); i++) {
-        char c = name[i];
-        if (!isalnum(c) && c != '_') {
-            return false;
-        }
-    }
-    return true;
-}
-
 // Called by WiFiManager when the "Setup" page is saved. All fields are validated first; if anything is
 // invalid nothing is changed.
 void on_setup_saved() {
-    String host = String(dbHostParam.getValue());
-    String name = String(dbNameParam.getValue());
-    String table = String(dbTableParam.getValue());
-    String user = String(dbUserParam.getValue());
-    String pass = String(dbPassParam.getValue());   // empty = keep the current password
+    String host = String(ingestHostParam.getValue());
     host.trim();
-    name.trim();
-    table.trim();
-    user.trim();
-    long port = String(dbPortParam.getValue()).toInt();
+    long port = String(ingestPortParam.getValue()).toInt();
+    String certName = String(ingestCertNameParam.getValue());   // optional
+    certName.trim();
     float offset = 0.0f;
 
     if (!is_valid_host(host) || port < 1 || port > 65535 ||
-        !is_valid_identifier(name) || !is_valid_identifier(table) ||
-        user.length() == 0 || user.length() > DB_USER_MAX_LEN || pass.length() > DB_PASS_MAX_LEN ||
+        (certName.length() > 0 && !is_valid_host(certName)) ||
         !parse_temp_offset(String(tempOffsetParam.getValue()), offset)) {
         send_message("Invalid settings, nothing changed.");
         update_setup_params();   // show the stored values again
         return;
     }
 
-    host.toCharArray(dbHost, sizeof(dbHost));
-    dbPort = (uint16_t)port;
-    name.toCharArray(dbName, sizeof(dbName));
-    table.toCharArray(dbTable, sizeof(dbTable));
-    user.toCharArray(dbUser, sizeof(dbUser));
-    if (pass.length() > 0) {
-        pass.toCharArray(dbPassword, sizeof(dbPassword));
-    }
+    host.toCharArray(ingestHost, sizeof(ingestHost));
+    ingestPort = (uint16_t)port;
+    certName.toCharArray(ingestCertName, sizeof(ingestCertName));
 
     Preferences prefs;
-    prefs.begin(DB_CFG_NAMESPACE, false);
-    prefs.putString("host", dbHost);
-    prefs.putUShort("port", dbPort);
-    prefs.putString("db", dbName);
-    prefs.putString("table", dbTable);
-    prefs.putString("user", dbUser);
-    prefs.putString("pass", dbPassword);
+    prefs.begin(INGEST_CFG_NAMESPACE, false);
+    prefs.putString("host", ingestHost);
+    prefs.putUShort("port", ingestPort);
+    prefs.putString("certname", ingestCertName);
     prefs.end();
 
     // The sensor is initialised after the portal closes, so the new offset takes effect right away
@@ -486,13 +448,20 @@ void on_setup_saved() {
     prefs.end();
 
     update_setup_params();
-    send_message("Settings saved: " + String(dbUser) + "@" + String(dbHost) + ":" + String(dbPort) +
-                 " -> " + String(dbName) + "." + String(dbTable) + ", temperature offset " + String(tempOffset, 1) + " C");
+    send_message("Settings saved: ingest server " + String(ingestHost) + ":" + String(ingestPort) +
+                 (ingestCertName[0] ? ", certificate name " + String(ingestCertName) : String("")) +
+                 ", temperature offset " + String(tempOffset, 1) + " C");
 }
 
 /******************************************************************
  *     Wi-Fi
 ******************************************************************/
+
+void refuse_portal_ota() {
+    send_message("Firmware upload through the portal is disabled. Restarting.");
+    delay(200);
+    ESP.restart();
+}
 
 void on_config_portal_started(WiFiManager *wm) {
     // Saved network not reachable (or none saved): portal is open -> blue solid, IAQ LEDs off
@@ -537,24 +506,24 @@ void connect_wifi(bool forcePortal) {
     wifiManager.setAPClientCheck(true);   // keep the portal open while a phone is connected to it
     wifiManager.setAPCallback(on_config_portal_started);
 
-    // Database server fields on a separate "Setup" page, so the address can be changed without
+    // Ingest server fields on a separate "Setup" page, so the address can be changed without
     // re-entering the Wi-Fi password
-    wifiManager.addParameter(&dbHostParam);
-    wifiManager.addParameter(&dbPortParam);
-    wifiManager.addParameter(&dbNameParam);
-    wifiManager.addParameter(&dbTableParam);
-    wifiManager.addParameter(&dbUserParam);
-    wifiManager.addParameter(&dbPassParam);
+    wifiManager.addParameter(&ingestHostParam);
+    wifiManager.addParameter(&ingestPortParam);
+    wifiManager.addParameter(&ingestCertNameParam);
     wifiManager.addParameter(&tempOffsetParam);
     wifiManager.setSaveParamsCallback(on_setup_saved);
-    std::vector<const char *> menu = {"wifi", "param", "info", "exit", "sep", "update"};
+    // No firmware upload from the portal: it would accept unsigned images, and a modified firmware could read
+    // the device credentials. The menu entry is hidden, and an upload sent to the URL directly is refused.
+    std::vector<const char *> menu = {"wifi", "param", "info", "exit"};
     wifiManager.setMenu(menu);
+    wifiManager.setPreOtaUpdateCallback(refuse_portal_ota);
 
     bool connected = false;
     if (forcePortal) {
-        // On-demand reconfiguration (double reset): portal first, saved network untouched until new
-        // credentials are saved. On timeout fall through to the normal saved-network connect.
-        send_message("Double reset detected. Opening config portal.");
+        // On-demand reconfiguration (double reset, or no ingest server set yet): portal first, saved network
+        // untouched until new credentials are saved. On timeout fall through to the normal saved-network connect.
+        send_message("Opening config portal.");
         connected = wifiManager.startConfigPortal(WIFI_PORTAL_SSID, portalPassword);
         if (!connected) {
             send_message("Portal closed without new settings. Using the saved network.");
@@ -581,15 +550,12 @@ void connect_wifi(bool forcePortal) {
     send_message("WiFi connected, IP: " + WiFi.localIP().toString());
 }
 
-void db_disconnect();
-
 void handle_wifi() {
     if (WiFi.status() == WL_CONNECTED) {
         if (!wifiWasConnected) {
             wifiWasConnected = true;
             blink_blue_led(false);
             set_blue_led(false);
-            db_disconnect();   // the old TCP socket did not survive the Wi-Fi drop
             send_message("WiFi reconnected, IP: " + WiFi.localIP().toString());
         }
         return;
@@ -598,8 +564,8 @@ void handle_wifi() {
     if (wifiWasConnected) {
         wifiWasConnected = false;
         lastWifiAttempt = millis();
+        wifiLostSince = millis();
         blink_blue_led(true);
-        db_disconnect();
         send_message("WiFi lost.");
     }
 
@@ -610,63 +576,6 @@ void handle_wifi() {
         send_message("WiFi reconnecting...");
         WiFi.reconnect();
     }
-}
-
-/******************************************************************
- *     Database
-******************************************************************/
-
-// Always close the socket explicitly: the MySQL library leaves it open when the login or a query times
-// out, so conn.connected() keeps returning true and the firmware would never reconnect.
-void db_disconnect() {
-    conn.close();
-    client.stop();
-}
-
-bool ensure_db_connected() {
-    if (conn.connected()) {
-        return true;
-    }
-    if (dbAttempted && (millis() - lastDbAttempt < DB_RECONNECT_INTERVAL_MS)) {
-        return false;
-    }
-    dbAttempted = true;
-    lastDbAttempt = millis();
-
-    send_message("Database connecting to " + String(dbHost) + ":" + String(dbPort) + "...");
-    if (conn.connect(dbHost, dbPort, dbUser, dbPassword)) {
-        send_message("Database connected.");
-        return true;
-    }
-
-    send_message("Database connection failed.");
-    db_disconnect();
-    return false;
-}
-
-bool send_to_db() {
-    if (WiFi.status() != WL_CONNECTED) {
-        return false;
-    }
-    if (!ensure_db_connected()) {
-        return false;
-    }
-
-    // dbName / dbTable are validated to [A-Za-z0-9_] when saved, so they are safe to put into the SQL text
-    char query[320];
-    snprintf(query, sizeof(query),
-             "INSERT INTO `%s`.`%s` (temperature, humidity, iaq, iaq_accuracy) VALUES (%.2f, %.2f, %.2f, %u)",
-             dbName, dbTable, temp, hum, iaq, (unsigned)iaq_accuracy);
-
-    MySQL_Query query_executor(&conn);
-    if (query_executor.execute(query)) {
-        send_message("Data successfully sent!");
-        return true;
-    }
-
-    send_message("Insert failed. Dropping the DB connection.");
-    db_disconnect();
-    return false;
 }
 
 /******************************************************************
@@ -691,9 +600,12 @@ void setup() {
     set_iaq_leds(true, true, true, true);
 
     load_settings();
+    forget_legacy_db_settings();
+    ingest::self_test();
 
+    // Open the portal on a double reset, and also while no ingest server is set (nothing could be sent)
     bool doubleReset = check_double_reset();
-    connect_wifi(doubleReset);
+    connect_wifi(doubleReset || ingestHost[0] == '\0');
     initialize_sensor();
 
     // turn off all LEDs after successful startup
@@ -703,7 +615,8 @@ void setup() {
     esp_task_wdt_init(WDT_TIMEOUT_S, true);
     esp_task_wdt_add(NULL);
 
-    lastSuccessfulSend = millis();
+    ingest::begin(ingestHost, ingestPort, ingestCertName);   // after the watchdog: the upload task registers with it
+    nextReadingMs = millis();
 }
 
 void loop() {
@@ -715,34 +628,34 @@ void loop() {
         sampleCounter++;
 
         // Read sensor datas
-        temp = iaqSensor.temperature;
-        hum = iaqSensor.humidity;
-        // Static IAQ: Bosch's recommended output for stationary devices. The plain IAQ output keeps
-        // rescaling itself to recent conditions (meant for portable devices), so a room that stays
-        // stuffy for days would slowly drift back towards "good".
-        iaq = iaqSensor.staticIaq;
-        iaq_accuracy = iaqSensor.staticIaqAccuracy;
+        temp = iaqSensor.temperature;   // heat-compensated, temperature offset applied
+        hum = iaqSensor.humidity;       // heat-compensated
+        iaq = iaqSensor.iaq;            // BSEC_OUTPUT_IAQ (not the static IAQ)
+        iaq_accuracy = iaqSensor.iaqAccuracy;
 
         maybe_save_state();
         send_message("#" + String(sampleCounter) + " T=" + String(temp, 2) + " H=" + String(hum, 2) +
-                     " sIAQ=" + String(iaq, 1) + " (acc " + String(iaq_accuracy) + ")" +
-                     " IAQ=" + String(iaqSensor.iaq, 1) + " (acc " + String(iaqSensor.iaqAccuracy) + ")" +
+                     " IAQ=" + String(iaq, 1) + " (acc " + String(iaq_accuracy) + ")" +
+                     " sIAQ=" + String(iaqSensor.staticIaq, 1) + " (acc " + String(iaqSensor.staticIaqAccuracy) + ")" +
                      " gas=" + String(iaqSensor.gasResistance / 1000.0f, 1) + " kOhm");
 
-        // Send data every SEND_EVERY_N_SAMPLES samples; on failure retry with the next sample
-        if (sampleCounter >= SEND_EVERY_N_SAMPLES) {
-            update_iaq_leds();
-
-            if (send_to_db()) {
-                sampleCounter = 0u;
-                lastSuccessfulSend = millis();
+        // Once a minute: queue the latest values with the time they were produced. The upload task sends
+        // them (and anything buffered while offline); this never waits for the network.
+        if ((int32_t)(millis() - nextReadingMs) >= 0) {
+            nextReadingMs += READING_INTERVAL_MS;
+            if ((int32_t)(millis() - nextReadingMs) >= 0) {
+                nextReadingMs = millis() + READING_INTERVAL_MS;   // fell behind (sensor stalled): restart the schedule
             }
+            update_iaq_leds();
+            ingest::enqueue(temp, hum, iaq, iaq_accuracy);
         }
     }
 
-    // Last-resort recovery: if nothing reached the database for a while (Wi-Fi, DB or sensor stuck),
-    // start from a clean state. Wi-Fi credentials and BSEC calibration survive the reboot.
-    if (millis() - lastSuccessfulSend >= NO_DATA_RESTART_MS) {
-        safe_restart("No data stored for 15 minutes. Restarting...");
+    // Last-resort recovery. Buffered readings, Wi-Fi credentials and the BSEC calibration survive the reboot.
+    if (!wifiWasConnected && millis() - wifiLostSince >= WIFI_LOST_RESTART_MS) {
+        safe_restart("Wi-Fi down for 15 minutes. Restarting...");
+    }
+    if (ingestHost[0] != '\0' && ingest::ms_since_server_response() >= NO_RESPONSE_RESTART_MS) {
+        safe_restart("No answer from the ingest server for 1 hour. Restarting...");
     }
 }

@@ -11,3 +11,7 @@
 # the BSEC Arduino library from lib_deps provides its own headers and precompiled library)
 inc/bsec_*.h
 obj/
+
+# Persoboard device credentials (secrets.h with the HMAC key and the TLS private key): never commit
+certs/
+**/secrets.h

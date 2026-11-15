@@ -13,7 +13,7 @@
     PlatformIO environment from platformio.ini. Default: lolin32.
 
 .PARAMETER Monitor
-    Open the serial monitor after a successful upload (set DEBUG_MODE to true in main.cpp to see output).
+    Open the serial monitor after a successful upload (set DEBUG_MODE to true in inc/log.hpp to see output).
 
 .PARAMETER Erase
     Erase the whole flash before uploading. This also deletes the saved Wi-Fi credentials
@@ -157,9 +157,23 @@ try {
         exit 1
     }
 
+    # Persoboard device credentials (the build fails without them)
+    $deviceLine = Select-String -Path 'platformio.ini' -Pattern '^\s*custom_pb_device\s*=\s*(\S+)' | Select-Object -First 1
+    if ($deviceLine) {
+        $device = $deviceLine.Matches[0].Groups[1].Value
+        $secrets = "certs\devices\$device\secrets.h"
+        if (-not (Test-Path $secrets)) {
+            Write-Problem "$secrets not found."
+            Write-Host "Generate it on the Persoboard side (python scripts/pki.py device $device) and copy it here,"
+            Write-Host 'or change custom_pb_device in platformio.ini. See README.md > Configuration.'
+            exit 1
+        }
+        Write-Step "Device credentials: $secrets"
+    }
+
     if (-not (Test-Path 'inc\config.hpp')) {
-        Write-Host 'WARNING: inc\config.hpp not found. Building without default DB credentials and with an OPEN setup portal.' -ForegroundColor Yellow
-        Write-Host '         Set the database settings in the portal (Setup page). See README.md > Configuration.' -ForegroundColor Yellow
+        Write-Host 'WARNING: inc\config.hpp not found. Building with an OPEN setup portal.' -ForegroundColor Yellow
+        Write-Host '         Set the ingest server in the portal (Setup page). See README.md > Configuration.' -ForegroundColor Yellow
     }
     elseif (-not (Select-String -Path 'inc\config.hpp' -Pattern '^\s*#define\s+PORTAL_PASSWORD' -Quiet)) {
         Write-Host 'WARNING: PORTAL_PASSWORD is not defined in inc\config.hpp, so the setup portal is an OPEN network.' -ForegroundColor Yellow
@@ -192,7 +206,7 @@ try {
     Write-Host "Firmware flashed to $Port." -ForegroundColor Green
 
     if ($Monitor) {
-        Write-Step 'Opening serial monitor (Ctrl+C to exit). Output requires DEBUG_MODE true in main.cpp.'
+        Write-Step 'Opening serial monitor (Ctrl+C to exit). Output requires DEBUG_MODE true in inc/log.hpp.'
         $ErrorActionPreference = 'Continue'
         & $script:Pio device monitor -e $Environment -p $Port   # interactive: keep it attached to the console
     }

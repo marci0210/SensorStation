@@ -5,10 +5,14 @@ An ESP32 firmware (PlatformIO / Arduino framework) that reads a **Bosch BME680**
 
 - computes an **Indoor Air Quality (IAQ)** index plus temperature and humidity,
 - shows the current air quality on a set of **status LEDs** (green / white / yellow / red),
-- logs the readings to a **MySQL / MariaDB** database on the local network (for example a NAS) about once a minute.
+- sends a reading once a minute to the **Persoboard ingest server** (the backend of the Persoboard dashboard) over
+  **HTTPS with mutual TLS**, each request signed with **HMAC-SHA256**.
 
 Wi-Fi credentials are not hard-coded. On first boot the device opens a **WiFiManager** captive portal where you
-pick the network.
+pick the network and the ingest server.
+
+The device-to-server contract (request format, signing, response codes, acceptance tests) is in
+[docs/esp32-firmware.md](docs/esp32-firmware.md).
 
 ---
 
@@ -20,7 +24,7 @@ pick the network.
 - [LED indicators](#led-indicators)
 - [Software and dependencies](#software-and-dependencies)
 - [Configuration](#configuration)
-- [Database setup](#database-setup)
+- [Persoboard ingest server](#persoboard-ingest-server)
 - [Build and flash](#build-and-flash)
 - [First boot and Wi-Fi setup](#first-boot-and-wi-fi-setup)
 - [How it works](#how-it-works)
@@ -33,7 +37,7 @@ pick the network.
 
 ## Features
 
-- **BSEC-based IAQ**: static IAQ index with accuracy (0–3), plus heat-compensated temperature and humidity
+- **BSEC-based IAQ**: IAQ index with accuracy (0–3), plus heat-compensated temperature and humidity
   with a configurable temperature offset for self-heating.
 - **Persistent calibration**: the BSEC calibration state is saved to flash when the IAQ accuracy improves, every 6 h
   once fully calibrated, and before any self-restart. It is restored on boot.
@@ -41,12 +45,18 @@ pick the network.
 - **Captive-portal Wi-Fi setup** through [WiFiManager](https://github.com/tzapu/WiFiManager). It opens
   automatically when the saved network can't be reached, or on demand by **pressing RST twice within 3 seconds**.
   It closes after 3 minutes so the device never gets stuck in setup mode.
-- **Self-healing connectivity**: Wi-Fi reconnect with periodic retries, the database socket closed on every failure,
-  a reboot when nothing has been stored for 15 minutes, and a hardware task watchdog for hangs.
-- **Database logging**: rows are inserted into a MySQL/MariaDB table through
-  [MySQL_MariaDB_Generic](https://github.com/khoih-prog/MySQL_MariaDB_Generic). Server address (IP or host name), port,
-  database, table, user and password are all set in the Wi-Fi portal, no re-flashing needed. A PostgreSQL schema is also included
-  (see [Database setup](#database-setup)).
+- **Secure upload**: mutual TLS that trusts only the Persoboard CA and checks the server's host name, plus an
+  HMAC-SHA256 signature with a timestamp and a random nonce on every request. The signing code checks itself against
+  the contract's test vector at every boot.
+- **No lost readings**: unsent readings wait in a 180-entry ring buffer (3 hours) that also survives software
+  restarts, and are delivered oldest first with their original timestamps once the server is back.
+- **Never blocks the sensor**: sending runs in its own task, so BSEC keeps its 3 s sample rate while the network is
+  slow or down.
+- **NTP time**: readings carry the time they were taken, from NTP (synced at start, every hour, and after a
+  rejected request).
+- **Self-healing connectivity**: Wi-Fi reconnect with periodic retries, retry with exponential backoff, a reboot after
+  15 minutes without Wi-Fi or 1 hour without any answer from the server, and a task watchdog for hangs.
+- **Configurable without re-flashing**: the ingest server's host name and port are set in the Wi-Fi portal.
 
 ---
 
@@ -59,7 +69,7 @@ pick the network.
 | **5 × LEDs** | Blue, green, white, yellow, red (3 mm or 5 mm). |
 | **5 × resistors** | 220 Ω for green, yellow and red; 100 Ω for blue and white (see the note below). |
 | Power | USB 5 V to the ESP32 board. Power the BME680 from **3.3 V**. |
-| Database server | Any MySQL/MariaDB server reachable on the LAN (originally a NAS at `192.168.0.151:3307`). |
+| Ingest server | The Persoboard ingest server: on a PC in the LAN (port 8443) or on OpenShift (port 443). |
 
 > **Resistor values:** the GPIOs drive 3.3 V. Red, yellow and green LEDs drop about 2 V, so 220 Ω gives roughly
 > 5–6 mA. Blue and white LEDs drop about 2.8–3.1 V, which leaves very little headroom at 3.3 V; with 220 Ω they would
@@ -127,7 +137,8 @@ side) → GND**. They are active-HIGH.
 | Blue **off** | Wi-Fi connected |
 | One of green / white / yellow / red on | Current air-quality level (see below) |
 
-The IAQ LED updates at each database send cycle (about once a minute), not on every sample.
+The IAQ LED updates with each reading (once a minute), not on every sample. It shows the same IAQ value that is
+sent to the server.
 
 ### IAQ colour scale
 
@@ -152,75 +163,109 @@ Libraries (PlatformIO downloads them automatically from `lib_deps`):
 | Library | Version | Purpose |
 |---|---|---|
 | [`boschsensortec/BSEC Software Library`](https://github.com/boschsensortec/BSEC-Arduino-library) | `^1.8.1492` | BME680 driver + BSEC IAQ algorithm (includes a precompiled `libalgobsec.a` for ESP32) |
-| [`khoih-prog/MySQL_MariaDB_Generic`](https://github.com/khoih-prog/MySQL_MariaDB_Generic) | `^1.7.2` | MySQL/MariaDB client |
 | [`tzapu/WiFiManager`](https://github.com/tzapu/WiFiManager) | latest from GitHub | Wi-Fi captive portal |
+
+HTTPS, TLS and the SHA-256 / HMAC code come with the Arduino-ESP32 core (`HTTPClient`, `WiFiClientSecure`, mbedTLS).
 
 The platform is pinned to the 6.x line because the task-watchdog call (`esp_task_wdt_init(timeout, panic)`) uses the
 core 2.x API. Core 3.x changed that signature.
-
-`platformio.ini` also sets a `lib_ignore` list (WiFiNINA, WiFi101, UIPEthernet, …). These are optional transports
-that MySQL_MariaDB_Generic would otherwise pull in, and they don't compile for the ESP32. `lib_ldf_mode = chain+`
-is needed so the library dependency finder evaluates the `#define`s correctly.
 
 ---
 
 ## Configuration
 
-### 1. Local secrets: `inc/config.hpp` (optional, not in git)
+### 1. Device credentials: `secrets.h` (required, not in git)
 
-`inc/config.hpp` is **ignored by git** (`**/config.hpp` in `.gitignore`). It holds the **portal password** and the
-**default** database credentials, which are used until others are saved in the portal:
+Each device has its own credentials, generated on the Persoboard side:
+
+```powershell
+python scripts/pki.py device bedroom-esp32
+```
+
+Copy the resulting `certs/devices/bedroom-esp32/secrets.h` into this repository at the **same path**
+(`certs/devices/<device-id>/secrets.h`), and set the device id in [platformio.ini](platformio.ini):
+
+```ini
+custom_pb_device = bedroom-esp32
+```
+
+The build adds `certs/devices/<custom_pb_device>/` to the include path. The firmware doesn't build without the file,
+and `flash.ps1` checks for it first.
+
+| Symbol | What it is |
+|---|---|
+| `PB_DEVICE_ID` | Device id, sent in the `X-PB-Device` header |
+| `PB_HMAC_KEY_HEX` | 32-byte signing key (64 hex characters) |
+| `PB_CA_CERT` | Persoboard CA certificate: the **only** CA the device trusts |
+| `PB_CLIENT_CERT` / `PB_CLIENT_KEY` | This device's certificate and private key (ECDSA P-256), for mutual TLS |
+
+- **It's a secret.** `certs/` and every `secrets.h` are git-ignored. Never commit, log or print any part of it; the
+  firmware doesn't either.
+- **One `secrets.h` per physical device.** For a second station, generate new credentials, copy them to
+  `certs/devices/<other-id>/` and build with `custom_pb_device` set to that id.
+- After a credential rotation (`scripts/pki.py device <id> --rotate`), replace the file and re-flash. A revoked device
+  just gets `401` for every request.
+
+### 2. Local settings: `inc/config.hpp` (optional, not in git)
+
+`inc/config.hpp` is **ignored by git** (`**/config.hpp` in `.gitignore`). It holds the **portal password** and,
+optionally, the **default** ingest server, which is used until another one is saved in the portal:
 
 ```cpp
 // inc/config.hpp
 #pragma once
 
-#define PORTAL_PASSWORD "at-least-8-characters"   // WPA2 password of the ESP_SensorKit setup network
+#define PORTAL_PASSWORD "at-least-8-characters"     // WPA2 password of the ESP_SensorKit setup network
 
-char db_user[]     = "your_db_user";               // defaults; can be changed in the portal
-char db_password[] = "your_db_password";
+// optional defaults; can be changed in the portal
+#define INGEST_DEFAULT_HOST "192.168.0.27"
+#define INGEST_DEFAULT_PORT 8443
+#define INGEST_DEFAULT_CERT_NAME "localhost"        // needed when the host is an IP address
 ```
 
 - **`PORTAL_PASSWORD` is strongly recommended.** Without it, `ESP_SensorKit` is an **open** network, so anyone nearby
-  could watch the database password being typed in, or use the portal while it's open (including its firmware-update
-  page). The build prints a warning if it's missing. WPA2 requires 8–63 characters, and the build fails otherwise.
-- Without `config.hpp` the firmware still builds. The default credentials are then empty, and you set them in the
-  portal.
+  could use the portal while it's open and point the device at another server (TLS would still refuse a server
+  without a Persoboard certificate). The build prints a warning if it's missing. WPA2 requires 8–63 characters, and
+  the build fails otherwise.
+- Without `config.hpp` the firmware still builds. The ingest server is then empty, and the portal opens at boot until
+  one is set.
 
-### 2. Settings in `src/main.cpp`
+### 3. Settings in the source
 
-**Hardware and network**
+**Hardware and network** (`src/main.cpp`, `inc/log.hpp`, `inc/ingest.hpp`)
 
 | Setting | Default | Description |
 |---|---|---|
-| `DEBUG_MODE` | `false` | Set to `true` for Serial output (115200 baud). When `false`, the serial port is never started. |
+| `DEBUG_MODE` (`inc/log.hpp`) | `false` | Set to `true` for Serial output (115200 baud). When `false`, the serial port is never started. |
 | `BME680_I2C_ADDR` | `0x76` | Sensor I²C address (`0x76` / `0x77`) |
 | `SDA_PIN` / `SCL_PIN` | `15` / `0` | I²C pins |
 | `*_LED_PIN` | see [Wiring](#leds) | LED pins |
-| `DEFAULT_DB_HOST` | `192.168.0.151` | Default database server (see [Database settings](#3-database-settings-in-the-portal)) |
-| `DEFAULT_DB_PORT` | `3307` | Default database port (3307 is the MariaDB 10 default on Synology NAS; standard MySQL uses 3306) |
-| `DEFAULT_DB_NAME` / `DEFAULT_DB_TABLE` | `myroom` / `sensor_data` | Default target table |
+| `INGEST_DEFAULT_HOST` / `INGEST_DEFAULT_PORT` / `INGEST_DEFAULT_CERT_NAME` | empty / `8443` / empty | Default ingest server; override in `config.hpp` or in the portal |
+| `INGEST_PATH` (`inc/ingest.hpp`) | `/api/room-climate/readings` | API path; the same locally and on OpenShift |
 | `WIFI_PORTAL_SSID` | `ESP_SensorKit` | Name of the configuration access point |
 | `WIFI_HOSTNAME` | `SensorStation` | Hostname the device uses on your network (shown in the router's client list) |
 
-**Timing and recovery**
+**Timing and recovery** (`src/main.cpp`; the sending constants are at the top of `src/ingest.cpp`)
 
 | Setting | Default | Description |
 |---|---|---|
-| `SEND_EVERY_N_SAMPLES` | `20` | Samples per database insert. With the 3 s BSEC LP rate this is about 60 s. |
+| `READING_INTERVAL_MS` | 60 s | One reading per minute, from the latest BSEC sample (BSEC samples every 3 s) |
 | `WIFI_CONNECT_TIMEOUT_S` / `WIFI_CONNECT_RETRIES` | `30` / `3` | How long the saved network is tried at boot before the portal opens |
 | `CONFIG_PORTAL_TIMEOUT_S` | `180` | Portal closes after this long without page activity, unless a device is connected to it (saved credentials are kept) |
 | `DRD_WINDOW_MS` | 3000 | Double-reset window: a second RST press within this time after boot opens the portal. Also adds this much to every boot. |
 | `WIFI_RECONNECT_INTERVAL_MS` | 30 s | How often `WiFi.reconnect()` is called while offline |
-| `DB_RECONNECT_INTERVAL_MS` | 30 s | Minimum time between DB connection attempts |
-| `NO_DATA_RESTART_MS` | 15 min | Reboot if no row has been stored for this long |
+| `WIFI_LOST_RESTART_MS` | 15 min | Reboot if Wi-Fi stays down this long |
+| `NO_RESPONSE_RESTART_MS` | 1 h | Reboot if the ingest server hasn't answered at all (any HTTP status) for this long |
 | `STATE_SAVE_PERIOD_MS` | 6 h | Re-save the calibrated BSEC state this often |
 | `DEFAULT_TEMP_OFFSET` | `0.0` | Temperature offset until one is set in the portal |
-| `WDT_TIMEOUT_S` | `120` | Hardware watchdog: reboot if `loop()` stops running for this long |
+| `WDT_TIMEOUT_S` | `60` | Task watchdog: reboot if `loop()` or the upload task stops running for this long |
+| `BUFFER_CAPACITY` (`ingest.cpp`) | 180 | Unsent readings kept (3 h); when full, the oldest is dropped |
+| `BACKOFF_MIN_MS` / `BACKOFF_MAX_MS` (`ingest.cpp`) | 5 s / 5 min | Retry delay after a failure, doubling, ±20 % jitter |
+| `REQUEST_GAP_MS` (`ingest.cpp`) | 2.5 s | Gap between requests while catching up (the server allows 30 per minute) |
 
-### 3. Database settings (in the portal)
+### 4. Ingest server and calibration (in the portal)
 
-Everything about where and how readings are stored can be changed **without re-flashing**:
+The ingest server and the temperature offset can be changed **without re-flashing**:
 
 1. Open the portal: press **RST twice within 3 s** (see [Changing the Wi-Fi network later](#changing-the-wi-fi-network-later)).
 2. Connect to `ESP_SensorKit` (using `PORTAL_PASSWORD`) and tap **Setup**.
@@ -228,99 +273,81 @@ Everything about where and how readings are stored can be changed **without re-f
 
    | Field | Example | Rules |
    |---|---|---|
-   | Database server | `192.168.0.151` or `db.example.com` | IP address or host name: letters, digits, `.`, `-` |
-   | Database port | `3307` | 1–65535 |
-   | Database name | `myroom` | Letters, digits, `_` |
-   | Table name | `sensor_data` | Letters, digits, `_` |
-   | Database user | `sensor` | Required, max. 32 characters |
-   | Database password | | **Leave empty to keep the current password.** Max. 64 characters. |
+   | Ingest server | `192.168.0.27` or `ingest-persoboard.apps.<cluster>` | IP address or host name: letters, digits, `.`, `-` |
+   | Ingest server port | `8443` (local) or `443` (OpenShift) | 1–65535 |
+   | Certificate name | `localhost` | A **DNS name from the server certificate**. Required when the server is an IP address; leave empty for a host name (see [below](#ip-address-or-host-name)). |
    | Temperature offset | `2.3` | °C, −10 to +10. See [Temperature offset](#temperature-offset-calibration). |
 
 4. Tap **Exit**. The device connects to the saved Wi-Fi and uses the new settings.
 
-- All values are stored in flash (namespace `dbcfg`), so they survive reboots and firmware updates.
+- The values are stored in flash (namespaces `ingest` and `sensor`), so they survive reboots and firmware updates.
   `.\flash.ps1 -Erase` resets them to the defaults.
 - **Everything is validated first.** If any field is invalid, nothing is changed and the stored values stay. The portal
   still says "Setup saved", so open **Setup** again to check what's stored.
-- **The password field is never pre-filled**, so the stored password doesn't appear in the page. Because empty means
-  "keep the current one", an empty database password can't be set from the portal.
-- The database and table names are inserted into the SQL statement, which is why only letters, digits and `_` are
-  allowed. The table must have the columns `temperature`, `humidity`, `iaq` and `iaq_accuracy` (see
-  [db/](db/)).
-- Wi-Fi and database settings are on separate pages, so changing one doesn't require re-entering the other.
+- While no ingest server is set, the portal opens at every boot (nothing could be sent anyway).
+- Wi-Fi and server settings are on separate pages, so changing one doesn't require re-entering the other.
+- The portal has **no firmware-update page**: it would accept unsigned images, and a modified firmware could read the
+  device credentials. Flash over USB instead.
 
 ---
 
-## Database setup
+## Persoboard ingest server
 
-Ready-made setup scripts are in [db/](db/):
+Once a minute the device sends the latest reading as a signed `POST` to `https://<host>:<port>/api/room-climate/readings`:
 
-| Script | For | Status |
-|---|---|---|
-| [db/mysql/setup.sql](db/mysql/setup.sql) | MySQL / MariaDB | **Used by the current firmware**. New installation. |
-| [db/mysql/migrate_v2.sql](db/mysql/migrate_v2.sql) | MySQL / MariaDB | Upgrade an existing table to the current layout |
-| [db/postgresql/setup.sql](db/postgresql/setup.sql) | PostgreSQL | Schema only. The firmware can't talk to PostgreSQL yet (see below). |
-
-### Table layout
-
-| Column | Type (MySQL / PostgreSQL) | Content |
-|---|---|---|
-| `timestamp` | `TIMESTAMP` / `TIMESTAMPTZ`, **primary key** | Measurement time, set by the database server (the device has no clock) |
-| `temperature` | `FLOAT` / `REAL` | °C, heat-compensated, temperature offset applied |
-| `humidity` | `FLOAT` / `REAL` | % relative humidity |
-| `iaq` | `FLOAT` / `REAL` | BSEC static IAQ (unscaled, so it can exceed 500) |
-| `iaq_accuracy` | `TINYINT UNSIGNED` / `SMALLINT` | 0–3 |
-
-The timestamp is the primary key, and there's no separate `id` column:
-
-- **Less storage:** this saves the `id` column and a separate index on `timestamp`.
-- **Faster time-range queries:** InnoDB stores rows ordered by the primary key.
-- **Uniqueness:** the device writes about one row per minute, so timestamps are unique.
-- **Self-healing on collision:** if two inserts ever land in the same second, the second one is rejected and simply
-  retried with the next sample.
-- **More devices later:** a single timestamp key won't work for several stations writing to one table. You would then
-  need a `device` column and a combined key `(device, timestamp)`.
-- **Quoting:** `timestamp` is also a type name, so the scripts quote it (`` `timestamp` `` in MySQL, `"timestamp"` in
-  PostgreSQL). Your own queries work without quotes in both, but quoting is the safe habit.
-- **MariaDB 2038 limit:** MariaDB before 11.5 stores `TIMESTAMP` only up to January 2038. Switching to `DATETIME` is
-  a simple change before then.
-
-### MySQL / MariaDB (current firmware)
-
-**New installation:**
-
-```bash
-mysql -h <nas-ip> -P 3307 -u root -p < db/mysql/setup.sql
+```json
+{"timestamp":"2026-11-15T15:52:08Z","temperature":22.40,"humidity":45.10,"iaq":61.5,"iaq_accuracy":3}
 ```
 
-The script creates the `myroom` database, the `myroom.sensor_data` table and an insert-only user
-`sensor@192.168.0.%`. Change the password in the script and put the same credentials in the portal's **Setup** page (or
-as defaults in `inc/config.hpp`). The server must accept **TCP connections from the LAN** (not just `localhost`), and
-the user must use `mysql_native_password`, which is the only authentication MySQL_MariaDB_Generic supports.
+The exact format, headers and signature are specified in [docs/esp32-firmware.md](docs/esp32-firmware.md).
 
-**Existing table** (older layout with `id`, `pressure` and `gas` columns): use
-[db/mysql/migrate_v2.sql](db/mysql/migrate_v2.sql). **Back up first**, then run it **step by step**. It checks for rows
-without a timestamp and for duplicate timestamps, which both have to be resolved before `timestamp` can become the
-primary key. Then it removes `id`, `pressure` and `gas` and rebuilds the table to free the space. It's written for
-MariaDB (Synology); on MySQL, remove the `IF EXISTS` parts.
+| Setting | Local (development) | OpenShift (production) |
+|---|---|---|
+| Ingest server | The PC's IP address (e.g. `192.168.0.27`; give the PC a fixed DHCP lease) | The ingest Route host, e.g. `ingest-persoboard.apps.<cluster>` |
+| Port | `8443` | `443` |
+| Certificate name | A DNS name from the server certificate, e.g. `localhost` | Empty |
 
-### PostgreSQL
+Moving the server (e.g. to OpenShift) only changes these settings in the portal. The server certificate is
+re-issued from the same CA, so `secrets.h` stays the same.
 
-```bash
-psql -h <host> -U postgres -v writer_pw='...' -v reader_pw='...' -f db/postgresql/setup.sql
-```
+### IP address or host name
 
-The script is idempotent (safe to re-run) and must be run with `psql`. It creates:
+The device checks that the server certificate is from the Persoboard CA **and** that it contains the expected name.
+The TLS library in the ESP32 Arduino core (mbedTLS 2.28) can only compare that name with the certificate's **DNS
+names**, not with its IP-address entries. So connecting by IP fails the check, even if the certificate lists the IP
+(the device logs `X509 - Certificate verification failed`).
 
-- database `sensorstation` with schema `myroom` and table `myroom.sensor_data`, using the same column names as the
-  MySQL version, so the firmware's `INSERT` statement works unchanged,
-- `timestamp` as the primary key, and range checks on humidity, IAQ (≥ 0) and accuracy,
-- the views `myroom.latest_reading` and `myroom.hourly_summary`,
-- the roles `sensor_writer` (INSERT only, for the device) and `sensor_reader` (SELECT only, e.g. for Grafana).
+That's what **Certificate name** is for: the device connects to the address in **Ingest server**, but checks the
+certificate against the certificate name.
 
-> ⚠️ The firmware currently speaks only the **MySQL protocol**. To log into PostgreSQL, the database code in
-> `main.cpp` has to be ported to a PostgreSQL client library. Embedded clients often support only `md5` or
-> cleartext passwords, while PostgreSQL 14+ defaults to `scram-sha-256`, so check the library before choosing it.
+- **Server by IP address** (local): set **Certificate name** to one of the certificate's DNS names. The certificate
+  from `python scripts/pki.py server --host 192.168.0.27` has `localhost`, which works. A dedicated name is clearer:
+  `python scripts/pki.py server --host persoboard-ingest --host 192.168.0.27`, then certificate name
+  `persoboard-ingest`. The name doesn't have to resolve in DNS; it's only compared with the certificate.
+- **Server by host name** (OpenShift, or a PC name your router resolves): leave **Certificate name** empty, and the
+  host name itself is checked.
+
+To see which names a server certificate has (from a PC with OpenSSL):
+`openssl s_client -connect 192.168.0.27:8443 </dev/null | openssl x509 -noout -ext subjectAltName`
+
+### What happens to a reading
+
+| Server answer | Device action |
+|---|---|
+| `201` | Stored: removed from the buffer, the next buffered reading follows right away |
+| `401` | Signature, device id, clock or nonce rejected: kept, NTP re-synced, retried with backoff. If it persists, `secrets.h` or the server's key list is wrong. |
+| `413` / `422` | The reading itself is invalid: dropped (the response body is logged with `DEBUG_MODE`) |
+| `429` | Rate limit: kept, retried after at least 60 s |
+| `503`, other, no answer, TLS error | Kept, retried with backoff (5 s doubling to 5 min) |
+
+Every attempt is a new request with a new timestamp, nonce and signature, but the **body stays the same**, so the
+reading keeps its own `timestamp` and a duplicate delivery just overwrites itself on the server.
+
+### The `db/` scripts
+
+The firmware no longer writes to a database itself; storage is the backend's job. The MySQL/MariaDB and PostgreSQL
+scripts in [db/](db/) are kept for the old direct-to-database setup only. On first boot, the new firmware removes the
+old database settings (including the password) from the device's flash.
 
 ---
 
@@ -334,14 +361,14 @@ The script builds the firmware, **finds the board's COM port automatically** and
 .\flash.ps1              # build + flash, auto-detect the port
 .\flash.ps1 -Monitor     # ...and open the serial monitor afterwards
 .\flash.ps1 -Port COM5   # use a specific port
-.\flash.ps1 -Erase       # wipe the flash first (forgets Wi-Fi + BSEC calibration)
+.\flash.ps1 -Erase       # wipe the flash first (forgets Wi-Fi, settings + BSEC calibration)
 .\flash.ps1 -List        # only show the detected ports, don't flash
 ```
 
 Port detection looks for the USB-serial chips used on ESP32 boards (CH340/CH9102, CP210x, FTDI, Espressif native
 USB) and ignores other COM ports, such as the motherboard's COM1. If more than one board is plugged in, it asks which
-one to use. It warns if `inc/config.hpp` or its `PORTAL_PASSWORD` is missing, and finds `pio` even when it isn't on
-`PATH`.
+one to use. It stops if the device's `secrets.h` is missing, warns if `inc/config.hpp` or its `PORTAL_PASSWORD` is
+missing, and finds `pio` even when it isn't on `PATH`.
 
 If PowerShell refuses to run the script (execution policy), use
 `powershell -ExecutionPolicy Bypass -File .\flash.ps1`.
@@ -375,6 +402,9 @@ The only environment is `lolin32`.
 3. Connect to it from a phone or laptop. The captive portal should open on its own; if it doesn't, go to
    **http://192.168.4.1**.
 4. Choose your Wi-Fi network, enter the password and save. The ESP32 stores the credentials and connects.
+   On the first boot, also open **Setup** and enter the ingest server (see
+   [Ingest server and calibration](#4-ingest-server-and-calibration-in-the-portal)); until one is set, the portal opens
+   at every boot.
 5. The portal stays open while your phone is connected to `ESP_SensorKit`. Once nothing is connected and no page has
    been loaded for **3 minutes**, the board reboots and tries the saved network again. The credentials are **never
    erased**, so after a power cut the device keeps retrying until the router is back, then reconnects on its own.
@@ -389,8 +419,8 @@ one). The blue LED turns solid and the `ESP_SensorKit` portal opens. Then contin
 - The BSEC calibration is **not** affected.
 - If you changed your router's name or password, you don't need to do anything: the saved network fails and the
   portal opens by itself after about 1.5 minutes.
-- `.\flash.ps1 -Erase` also resets Wi-Fi, but it **deletes the BSEC calibration** too, because both are stored in the
-  same flash area.
+- `.\flash.ps1 -Erase` also resets Wi-Fi, but it **deletes the BSEC calibration** and the Setup values too, because
+  they are all stored in the same flash area.
 
 The double reset is detected with a flag in flash, not in RTC memory, because on the ESP32 the RST (EN) button cuts
 power to the whole chip. The BOOT button can't be used for this: on this board it's wired to GPIO 0, the sensor's SCL
@@ -403,10 +433,12 @@ line, and holding it during reset puts the ESP32 into flashing mode.
 ```
 setup()
  ├─ configure LED pins, all IAQ LEDs on
- ├─ load_db_config(): database host/port from flash (defaults 192.168.0.151:3307)
+ ├─ load_settings(): ingest server + temperature offset from flash; remove old DB settings
+ ├─ ingest::self_test(): signing code vs. the contract's test vector
  ├─ check_double_reset(): flag in flash set → this is the 2nd reset → open portal on demand;
  │    otherwise set the flag, wait 3 s, clear it
- ├─ (on demand) WiFiManager.startConfigPortal() → on timeout continue with the saved network
+ ├─ (double reset or no ingest server set) WiFiManager.startConfigPortal()
+ │    → on timeout continue with the saved network
  ├─ WiFiManager.autoConnect("ESP_SensorKit")
  │    ├─ try saved network: 3 × 30 s (blue LED blinking)
  │    └─ otherwise open portal (blue solid) for 180 s → reboot on timeout
@@ -416,19 +448,29 @@ setup()
  │    ├─ loadState() → restore BSEC calibration from flash
  │    └─ subscribe to IAQ, static IAQ, CO₂-eq, bVOC-eq, raw T/H/gas,
  │       heat-compensated T/H at BSEC_SAMPLE_RATE_LP (one sample every 3 s)
- └─ start the 120 s task watchdog
+ ├─ start the 60 s task watchdog
+ └─ ingest::begin(): restore the buffer from RTC memory, start NTP, start the upload task (core 0)
 
-loop()
+loop()  (core 1)
  ├─ feed watchdog
- ├─ handle_wifi(): on loss → blink blue, drop DB socket, WiFi.reconnect() every 30 s
+ ├─ handle_wifi(): on loss → blink blue, WiFi.reconnect() every 30 s
  ├─ when iaqSensor.run() returns a new sample (≈ every 3 s):
- │    ├─ read temperature, humidity, static IAQ + accuracy
+ │    ├─ read temperature, humidity, IAQ + accuracy
  │    ├─ save BSEC state if accuracy improved (or every 6 h when calibrated)
- │    └─ every 20th sample (≈ 60 s):
+ │    └─ once a minute:
  │         ├─ update the IAQ colour LED
- │         └─ send_to_db(): connect if needed (max. every 30 s), INSERT;
- │            on any failure close the socket and retry with the next sample
- └─ nothing stored for 15 min → save state, ESP.restart()
+ │         └─ ingest::enqueue(): add the reading, with the time it was taken, to the ring buffer
+ └─ Wi-Fi down 15 min, or no server answer for 1 h → save state, ESP.restart()
+
+upload task  (core 0, every 250 ms)
+ ├─ feed watchdog; wait until NTP has set the clock
+ ├─ give readings taken before the first NTP sync their real time
+ └─ if Wi-Fi is up and no backoff is pending: POST the oldest reading
+      (new mutual-TLS connection, new timestamp + nonce + signature, same body)
+      ├─ 201 → remove it, send the next one 2.5 s later
+      ├─ 413 / 422 → drop it (retrying can't help)
+      ├─ 401 → keep it, re-sync NTP, back off
+      └─ 429 / 503 / no answer → keep it, back off (5 s … 5 min, ±20 %; ≥ 60 s for 429)
 ```
 
 ### Connection recovery
@@ -440,9 +482,10 @@ fixes:
 |---|---|---|
 | No way to switch networks while the old one is still up | The portal only opened when the saved network failed. | Press RST twice within 3 s to open the portal on demand. |
 | Device "forgets" the Wi-Fi after a power cut | The ESP32 boots faster than the router. The saved network wasn't found, the WiFiManager portal opened, and it had **no timeout**, so the device sat in AP mode forever. (The 20 s boot wait loop also never called `WiFi.begin()`, so it couldn't connect.) | Saved network tried 3 × 30 s, portal timeout of 3 min, then reboot. Credentials are kept. |
-| Stops sending data and never recovers | MySQL_MariaDB_Generic leaves the TCP socket open when the login or a query times out. `conn.connected()` then kept returning `true`, so the firmware never reconnected and every INSERT failed. | `db_disconnect()` closes the socket after every failed connect or query, and after every Wi-Fi drop. |
+| Stops sending data and never recovers | The MySQL library left the TCP socket open when the login or a query timed out, so the firmware never reconnected. | Gone with the MySQL client: every HTTPS request uses a new connection, and a hanging one is ended by its 10 s timeouts or the watchdog. |
+| Readings lost while the server or network is down | Each reading was sent once; a failure just skipped it. | Ring buffer of 180 readings, kept across software restarts and delivered with their original timestamps. |
 | Flaky reconnects | `WiFi.begin()` was called every 3 s while offline, interrupting the driver's own reconnect. Wi-Fi modem sleep also causes drops on many routers. | Driver auto-reconnect plus `WiFi.reconnect()` every 30 s; `WiFi.setSleep(false)`. |
-| Any other stuck state (sensor, network stack, NAS) | — | Reboot after 15 min without a stored row, plus a 120 s hardware watchdog. BSEC state is saved first. |
+| Any other stuck state (sensor, network stack) | — | Reboot after 15 min without Wi-Fi or 1 h without any answer from the server, plus a 60 s task watchdog on both the main loop and the upload task. BSEC state and buffered readings are kept. |
 
 ### IAQ accuracy and calibration
 
@@ -460,7 +503,7 @@ and polluted air, before it reaches accuracy 3. The saved BSEC state, together w
 keep that calibration across reboots.
 
 A saved state only fits the **BSEC configuration and library version** it was created with. BSEC may still accept a
-mismatched state, and then produces nonsense, such as a static IAQ far above 500 at accuracy 2. So each save also
+mismatched state, and then produces nonsense, such as an IAQ far above 500 at accuracy 2. So each save also
 stores a **fingerprint** (FNV-1a hash of the configuration and the library version). At boot, a state with a different
 fingerprint is discarded and calibration starts over. This happens automatically after a BSEC library update or a
 configuration change.
@@ -476,29 +519,29 @@ Flash layout (emulated EEPROM, 161 bytes):
 
 ### Measured values
 
-| Stored column | Source | Notes |
+| Sent field | Source | Notes |
 |---|---|---|
+| `timestamp` | NTP time when the reading was taken (UTC) | Not the time of sending, so buffered readings keep their real time |
 | `temperature` | BSEC heat-compensated temperature | Corrected by the **temperature offset** (see below) |
-| `humidity` | BSEC heat-compensated relative humidity | Recalculated by BSEC at the corrected temperature |
-| `iaq` | BSEC **static IAQ** (`iaqSensor.staticIaq`) | Bosch's recommended output for stationary devices |
-| `iaq_accuracy` | Accuracy of the static IAQ (`staticIaqAccuracy`) | 0–3, see above |
+| `humidity` | BSEC heat-compensated relative humidity | Recalculated by BSEC at the corrected temperature; clamped to 0–100 % |
+| `iaq` | BSEC **IAQ** (`BSEC_OUTPUT_IAQ`, `iaqSensor.iaq`) | Required by the Persoboard contract; clamped to 0–500 |
+| `iaq_accuracy` | Accuracy of that IAQ (`iaqAccuracy`) | 0–3, see above. Readings are sent at every accuracy; the dashboard shows it next to the IAQ. |
 
 **BSEC configuration.** The firmware loads `generic_33v_3s_4d` from the BSEC library: 3.3 V supply, 3 s sample
 interval (LP mode, matching `BSEC_SAMPLE_RATE_LP`) and a 4-day calibration history. The configuration is loaded before
 the saved state is restored, because a state only fits the configuration it was created with. If you change it
 (e.g. to `generic_33v_3s_28d` for a steadier but slower-adapting IAQ), BSEC rejects the old state and recalibrates.
 
-**Static IAQ vs. IAQ.** The plain IAQ output keeps rescaling itself to recent conditions, which suits a device carried
-around. For a monitor that stays in one room, a room that stays stuffy for days would slowly drift back toward
-"good". Static IAQ doesn't drift like that. Both are calculated; the IAQ LEDs and the database use static IAQ.
+**IAQ vs. static IAQ.** The plain IAQ output keeps rescaling itself to recent conditions, so in a room that stays
+stuffy for days it slowly drifts back toward "good"; static IAQ doesn't. The Persoboard contract asks for the plain
+IAQ, so that is what's sent and what the LEDs show. Static IAQ is still calculated and printed with `DEBUG_MODE`.
 
-> ⚠️ Rows stored before this change hold the **plain** IAQ in the `iaq` column. Keep that in mind when comparing old
-> and new data.
+> ⚠️ The previous firmware stored the **static** IAQ in its database (and versions before that the plain IAQ). Keep
+> that in mind when comparing old and new data.
 
-The BSEC subscription also provides the plain IAQ, CO₂ equivalent, breath-VOC equivalent and raw gas resistance, which
-aren't stored. Pressure isn't logged either. To log more values, read them from the `Bsec` object (e.g.
-`iaqSensor.co2Equivalent`, `iaqSensor.breathVocEquivalent`, `iaqSensor.iaq`, `iaqSensor.pressure`) and add matching
-columns to the table and the `INSERT` query.
+The BSEC subscription also provides the static IAQ, CO₂ equivalent, breath-VOC equivalent and raw gas resistance,
+which aren't sent. Pressure isn't either. The server rejects unknown fields, so sending more values needs a change to
+the Persoboard contract first.
 
 ### Temperature offset (calibration)
 
@@ -524,17 +567,20 @@ offset smaller and more stable. Re-check the offset if you move the station or c
 
 ```
 .
-├── platformio.ini            # PlatformIO environment (lolin32), build flags, library dependencies
+├── platformio.ini            # PlatformIO environment (lolin32), device id, build flags, library dependencies
 ├── flash.ps1                 # Build + flash with automatic COM port detection (Windows)
 ├── src/
-│   └── main.cpp              # The whole firmware
+│   ├── main.cpp              # Sensor, LEDs, Wi-Fi, portal, settings
+│   └── ingest.cpp            # Upload to Persoboard: TLS, signing, ring buffer, NTP, retries
 ├── inc/
-│   └── config.hpp            # Portal password + default DB credentials (optional, git-ignored)
-├── db/
-│   ├── mysql/setup.sql       # MySQL/MariaDB schema + device user (used by the firmware)
-│   ├── mysql/migrate_v2.sql  # Upgrade an existing table (drop id/pressure/gas, timestamp as key)
-│   └── postgresql/setup.sql  # PostgreSQL schema, views and roles
+│   ├── ingest.hpp            # Interface of ingest.cpp, INGEST_PATH
+│   ├── log.hpp               # DEBUG_MODE and send_message()
+│   └── config.hpp            # Portal password + default ingest server (optional, git-ignored)
+├── certs/devices/<id>/
+│   └── secrets.h             # Device credentials from Persoboard (required, git-ignored)
+├── db/                       # Scripts of the old direct-to-database setup (no longer used by the firmware)
 ├── docs/
+│   ├── esp32-firmware.md     # Device ↔ Persoboard contract
 │   └── schematic.svg         # Wiring schematic
 └── .vscode/                  # VS Code / PlatformIO IDE settings
 ```
@@ -545,18 +591,23 @@ offset smaller and more stable. Re-check the offset if you move the station or c
 
 | Symptom | Possible cause / fix |
 |---|---|
-| Build warning `PORTAL_PASSWORD not defined` | Add `#define PORTAL_PASSWORD "..."` to `inc/config.hpp` (see [Configuration](#1-local-secrets-incconfighpp-optional-not-in-git)). |
+| Build error `secrets.h not found` | Copy the device's `secrets.h` to `certs/devices/<id>/` and check `custom_pb_device` in `platformio.ini` (see [Device credentials](#1-device-credentials-secretsh-required-not-in-git)). |
+| Build warning `PORTAL_PASSWORD not defined` | Add `#define PORTAL_PASSWORD "..."` to `inc/config.hpp` (see [Local settings](#2-local-settings-incconfighpp-optional-not-in-git)). |
 | Can't connect to `ESP_SensorKit` | Since `PORTAL_PASSWORD` was added, the network asks for that password. |
 | Nothing on the serial monitor | `DEBUG_MODE` is `false` by default. Set it to `true` and re-flash. The first line printed is the reset reason, which helps tell a watchdog reboot from a power cut. |
-| Static IAQ far above 500 although accuracy is 2–3 | The restored calibration doesn't fit the current BSEC configuration. Firmware from this version on detects this and recalibrates automatically. If it still happens after a fresh calibration, check the raw gas resistance with `DEBUG_MODE` (typically tens to hundreds of kΩ; very low values mean solvents or alcohol near the sensor). |
+| IAQ far above 500 (`DEBUG_MODE`) although accuracy is 2–3 | The restored calibration doesn't fit the current BSEC configuration. Firmware from this version on detects this and recalibrates automatically. If it still happens after a fresh calibration, check the raw gas resistance with `DEBUG_MODE` (typically tens to hundreds of kΩ; very low values mean solvents or alcohol near the sensor). |
 | IAQ stays at 25 and accuracy stays at 0 | Normal during the first few minutes or hours (BSEC run-in). Leave it running. |
 | No sensor data at all | Check the wiring and I²C address (`0x76` vs `0x77`). Make sure the BME680 runs on 3.3 V. |
 | Board doesn't boot / hangs at reset | Something may be pulling GPIO 0 or GPIO 15 low (strapping pins). Disconnect the sensor and check, or move I²C to other pins. |
 | Blue LED blinking | Wi-Fi lost. The device reconnects on its own and reboots after 15 min if that doesn't work. |
-| Blue LED solid, `ESP_SensorKit` network visible | Portal is open: RST was pressed twice, or the saved network isn't reachable. Set up a network, or wait 3 min. |
+| Blue LED solid, `ESP_SensorKit` network visible | Portal is open: RST was pressed twice, the saved network isn't reachable, or no ingest server is set. Set it up, or wait 3 min. |
 | Portal opens right after flashing or opening the serial monitor | The monitor reset the board within 3 s of the post-upload reset. `platformio.ini` sets `monitor_rts = 0` / `monitor_dtr = 0` to prevent this; check that your monitor tool doesn't toggle DTR/RTS. |
 | Portal opened after a quick power flicker | Expected: a power cut within 3 s of booting counts as a double reset. The portal closes after 3 min and the device reconnects. |
-| Board reboots about every 15 min | No row is reaching the database: check the settings in the portal's **Setup** page (a typo in the host name, user, password or table name fails silently), that the DB accepts remote connections, the user's host/privileges, and that the table exists. |
+| Nothing arrives on the dashboard | Turn on `DEBUG_MODE` and watch the `Ingest:` lines. "Signing self-test FAILED" means a broken build. "no response" with a TLS error is a connection or certificate problem (next rows). A status code is the server's answer (see [What happens to a reading](#what-happens-to-a-reading)). |
+| TLS error, certificate verification failed | The server is set by IP address and **Certificate name** is empty or not a DNS name in the server certificate (see [IP address or host name](#ip-address-or-host-name)); or the server certificate isn't from the Persoboard CA in `secrets.h`; or the clock is wrong. |
+| Every request gets `401` | Wrong or rotated `secrets.h`, the device was revoked, or the server's key list doesn't have this device. A wrong clock also causes it, but the device re-syncs NTP on its own. |
+| No requests at all, Wi-Fi is up | The clock isn't set yet: the device sends nothing until NTP works. Check that the network allows NTP (UDP 123) to `pool.ntp.org` / `time.google.com`. |
+| Board reboots about once an hour | The ingest server hasn't answered for an hour (stopped, wrong host/port, firewall). Readings stay buffered across these reboots (up to 3 h). |
 | Captive portal doesn't show up | Connect to `ESP_SensorKit` and browse to `http://192.168.4.1` manually. |
 | Onboard LED lights up | Expected: it's on GPIO 5 (active-LOW) and is lit whenever the green LED is off. |
 
@@ -564,19 +615,21 @@ offset smaller and more stable. Re-check the offset if you move the station or c
 
 ## Known limitations / notes
 
-- **Credentials stored unencrypted in flash**: the database password is kept in NVS in plain text, so anyone with
-  physical access and a USB cable can read it out. Give the device's DB user only `INSERT` rights on its table, as
-  the setup scripts in [db/](db/) do.
-- **Plain MySQL over TCP, no TLS**: fine on a home LAN. A database in the cloud (e.g. OpenShift) needs an encrypted
-  path, either a TLS-capable client or an HTTPS ingest service in front of the database.
-- **MySQL only**: the firmware uses the MySQL protocol. The PostgreSQL script is ready, but the firmware's database
-  code has to be ported before it can use it.
-- **No clock on the device**: there is no RTC/NTP, so timestamps come from the database (`timestamp` column).
-- **Blocking DB connect**: a connection attempt to an unreachable server can block `loop()` for up to about 50 s
-  (library retries). BSEC then reports a timing warning for that cycle, which is harmless. The watchdog timeout
-  (120 s) allows for this.
+- **Device credentials in flash**: `secrets.h` is compiled into the firmware. Without flash encryption, anyone with
+  physical access and a USB cable can read the HMAC key and the TLS private key. For production, enable **flash
+  encryption** and **Secure Boot v2**, and disable JTAG (all three burn eFuses and **can't be undone**: try them on a
+  spare board first; see [docs/esp32-firmware.md](docs/esp32-firmware.md), section 7). If a device is lost, revoke its
+  credentials on the Persoboard side.
+- **No OTA updates**: the portal's firmware-update page is disabled because it would accept unsigned images. If OTA is
+  added later, it must accept only signed images.
+- **Buffer and power cuts**: the buffer of unsent readings is in RTC memory. It survives software restarts (the
+  device's own recovery reboots, the watchdog, crashes), but **not a power cut or the RST button**.
+- **Clock needed**: nothing is sent until NTP has set the clock. Readings taken before that get their time
+  afterwards; if the device restarts before NTP ever worked, those readings are lost.
+- **Host name verification**: the TLS library can't match IP addresses against the certificate, so a server set by IP
+  address needs a **Certificate name** (see [IP address or host name](#ip-address-or-host-name)).
 - **Flash wear**: the BSEC state (157 bytes) is written when accuracy improves, every 6 h, and before self-restarts.
-  NVS wear-levels these writes, so wear is negligible even if the NAS is offline for days.
+  NVS wear-levels these writes, so wear is negligible even if the server is offline for days.
 - **Bosch standalone BSEC package**: `inc/bsec_*.h` and `obj/` from an earlier linking attempt are git-ignored and not
   used by the build. The BSEC Arduino library from `lib_deps` brings its own headers and precompiled library.
 
