@@ -6,3 +6,8 @@
 .vscode/extensions.json
 
 **/config.hpp
+
+# Bosch BSEC standalone package (proprietary, not redistributable, not used by the build;
+# the BSEC Arduino library from lib_deps provides its own headers and precompiled library)
+inc/bsec_*.h
+obj/

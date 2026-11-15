@@ -1,0 +1,172 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <title>SensorStation wiring schematic</title>
+  <desc>WEMOS LOLIN32 (ESP32) connected to a BME680 breakout over I2C (SDA GPIO15, SCL GPIO0) and five LEDs with series resistors on GPIO22, 5, 23, 33 and 32.</desc>
+
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2937"/>
+    </marker>
+    <style>
+      .wire  { stroke: #1f2937; stroke-width: 2; fill: none; stroke-linecap: square; }
+      .vcc   { stroke: #b91c1c; }
+      .gnd   { stroke: #1f2937; }
+      .sig   { stroke: #1d4ed8; }
+      .block { stroke: #1f2937; stroke-width: 2; }
+      .res   { fill: #ffffff; stroke: #1f2937; stroke-width: 2; }
+      .led   { stroke: #1f2937; stroke-width: 2; stroke-linejoin: round; }
+      .bar   { stroke: #1f2937; stroke-width: 3; }
+      .ray   { stroke: #1f2937; stroke-width: 1.5; }
+      .dot   { fill: #1f2937; }
+      .pin   { font-size: 13px; fill: #111827; }schematic 
+      .small { font-size: 12px; fill: #374151; }
+      .name  { font-size: 16px; font-weight: 700; fill: #111827; }
+      .rail  { font-size: 13px; font-weight: 700; }
+      .note  { font-size: 13px; fill: #1f2937; }
+    </style>
+  </defs>
+
+  <!-- Background (keeps the drawing readable in GitHub dark mode) -->
+  <rect x="0" y="0" width="960" height="800" fill="#ffffff"/>
+
+  <text x="40" y="44" font-size="20" font-weight="700" fill="#111827">SensorStation – wiring schematic</text>
+
+  <!-- ============ Power rails ============ -->
+  <line class="wire vcc" x1="120" y1="90" x2="480" y2="90"/>
+  <text class="rail" x="300" y="82" text-anchor="middle" fill="#b91c1c">3V3</text>
+
+  <line class="wire gnd" x1="120" y1="610" x2="900" y2="610"/>
+  <text class="rail" x="300" y="630" text-anchor="middle" fill="#1f2937">GND</text>
+
+  <!-- ============ BME680 breakout ============ -->
+  <rect class="block" x="80" y="200" width="160" height="200" rx="6" fill="#eef6ff"/>
+  <text class="name"  x="160" y="292" text-anchor="middle">BME680</text>
+  <text class="small" x="160" y="310" text-anchor="middle">breakout</text>
+
+  <text class="pin" x="120" y="222" text-anchor="middle">VCC</text>
+  <text class="pin" x="200" y="222" text-anchor="middle">CS</text>
+  <text class="pin" x="120" y="390" text-anchor="middle">GND</text>
+  <text class="pin" x="200" y="390" text-anchor="middle">SDO</text>
+  <text class="pin" x="232" y="264" text-anchor="end">SDA</text>
+  <text class="pin" x="232" y="324" text-anchor="end">SCL</text>
+
+  <!-- VCC and CS to 3V3 -->
+  <line class="wire vcc" x1="120" y1="200" x2="120" y2="90"/>
+  <line class="wire vcc" x1="200" y1="200" x2="200" y2="90"/>
+  <circle class="dot" cx="200" cy="90" r="4"/>
+
+  <!-- GND and SDO to GND (SDO low = address 0x76) -->
+  <line class="wire gnd" x1="120" y1="400" x2="120" y2="610"/>
+  <line class="wire gnd" x1="200" y1="400" x2="200" y2="610"/>
+  <circle class="dot" cx="200" cy="610" r="4"/>
+
+  <!-- I2C -->
+  <line class="wire sig" x1="240" y1="260" x2="360" y2="260"/>
+  <line class="wire sig" x1="240" y1="320" x2="360" y2="320"/>
+  <text class="small" x="300" y="252" text-anchor="middle" fill="#1d4ed8">SDA</text>
+  <text class="small" x="300" y="312" text-anchor="middle" fill="#1d4ed8">SCL</text>
+
+  <!-- ============ ESP32 board ============ -->
+  <rect class="block" x="360" y="140" width="240" height="420" rx="6" fill="#f3f4f6"/>
+  <text class="name"  x="480" y="392" text-anchor="middle">WEMOS LOLIN32</text>
+  <text class="small" x="480" y="412" text-anchor="middle">(ESP32, powered via USB)</text>
+
+  <text class="pin" x="480" y="162" text-anchor="middle">3V3</text>
+  <text class="pin" x="480" y="548" text-anchor="middle">GND</text>
+  <text class="pin" x="370" y="264">GPIO15 (SDA)</text>
+  <text class="pin" x="370" y="324">GPIO0 (SCL)</text>
+  <text class="pin" x="590" y="204" text-anchor="end">GPIO22</text>
+  <text class="pin" x="590" y="284" text-anchor="end">GPIO5</text>
+  <text class="pin" x="590" y="364" text-anchor="end">GPIO23</text>
+  <text class="pin" x="590" y="444" text-anchor="end">GPIO33</text>
+  <text class="pin" x="590" y="524" text-anchor="end">GPIO32</text>
+
+  <line class="wire vcc" x1="480" y1="140" x2="480" y2="90"/>
+  <line class="wire gnd" x1="480" y1="560" x2="480" y2="610"/>
+  <circle class="dot" cx="480" cy="610" r="4"/>
+
+  <!-- ============ LED branches: GPIO -> R -> LED -> GND ============ -->
+  <!-- common cathode / GND bus -->
+  <line class="wire gnd" x1="900" y1="200" x2="900" y2="610"/>
+
+  <!-- Blue, GPIO22 -->
+  <g transform="translate(0,200)">
+    <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
+    <rect class="res" x="650" y="-9" width="70" height="18"/>
+    <line class="wire" x1="720" y1="0" x2="780" y2="0"/>
+    <polygon class="led" points="780,-12 780,12 806,0" fill="#3b82f6"/>
+    <line class="bar" x1="806" y1="-12" x2="806" y2="12"/>
+    <line class="wire" x1="806" y1="0" x2="900" y2="0"/>
+    <line class="ray" x1="789" y1="-15" x2="797" y2="-26" marker-end="url(#arr)"/>
+    <line class="ray" x1="798" y1="-13" x2="806" y2="-24" marker-end="url(#arr)"/>
+    <text class="small" x="685" y="-16" text-anchor="middle">R1 · 100 Ω</text>
+    <text class="small" x="793" y="30"  text-anchor="middle">Blue · Wi-Fi status</text>
+  </g>
+
+  <!-- Green, GPIO5 -->
+  <g transform="translate(0,280)">
+    <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
+    <rect class="res" x="650" y="-9" width="70" height="18"/>
+    <line class="wire" x1="720" y1="0" x2="780" y2="0"/>
+    <polygon class="led" points="780,-12 780,12 806,0" fill="#22c55e"/>
+    <line class="bar" x1="806" y1="-12" x2="806" y2="12"/>
+    <line class="wire" x1="806" y1="0" x2="900" y2="0"/>
+    <line class="ray" x1="789" y1="-15" x2="797" y2="-26" marker-end="url(#arr)"/>
+    <line class="ray" x1="798" y1="-13" x2="806" y2="-24" marker-end="url(#arr)"/>
+    <circle class="dot" cx="900" cy="0" r="4"/>
+    <text class="small" x="685" y="-16" text-anchor="middle">R2 · 220 Ω</text>
+    <text class="small" x="793" y="30"  text-anchor="middle">Green · IAQ 0–50</text>
+  </g>
+
+  <!-- White, GPIO23 -->
+  <g transform="translate(0,360)">
+    <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
+    <rect class="res" x="650" y="-9" width="70" height="18"/>
+    <line class="wire" x1="720" y1="0" x2="780" y2="0"/>
+    <polygon class="led" points="780,-12 780,12 806,0" fill="#ffffff"/>
+    <line class="bar" x1="806" y1="-12" x2="806" y2="12"/>
+    <line class="wire" x1="806" y1="0" x2="900" y2="0"/>
+    <line class="ray" x1="789" y1="-15" x2="797" y2="-26" marker-end="url(#arr)"/>
+    <line class="ray" x1="798" y1="-13" x2="806" y2="-24" marker-end="url(#arr)"/>
+    <circle class="dot" cx="900" cy="0" r="4"/>
+    <text class="small" x="685" y="-16" text-anchor="middle">R3 · 100 Ω</text>
+    <text class="small" x="793" y="30"  text-anchor="middle">White · IAQ 51–100</text>
+  </g>
+
+  <!-- Yellow, GPIO33 -->
+  <g transform="translate(0,440)">
+    <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
+    <rect class="res" x="650" y="-9" width="70" height="18"/>
+    <line class="wire" x1="720" y1="0" x2="780" y2="0"/>
+    <polygon class="led" points="780,-12 780,12 806,0" fill="#facc15"/>
+    <line class="bar" x1="806" y1="-12" x2="806" y2="12"/>
+    <line class="wire" x1="806" y1="0" x2="900" y2="0"/>
+    <line class="ray" x1="789" y1="-15" x2="797" y2="-26" marker-end="url(#arr)"/>
+    <line class="ray" x1="798" y1="-13" x2="806" y2="-24" marker-end="url(#arr)"/>
+    <circle class="dot" cx="900" cy="0" r="4"/>
+    <text class="small" x="685" y="-16" text-anchor="middle">R4 · 220 Ω</text>
+    <text class="small" x="793" y="30"  text-anchor="middle">Yellow · IAQ 101–150</text>
+  </g>
+
+  <!-- Red, GPIO32 -->
+  <g transform="translate(0,520)">
+    <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
+    <rect class="res" x="650" y="-9" width="70" height="18"/>
+    <line class="wire" x1="720" y1="0" x2="780" y2="0"/>
+    <polygon class="led" points="780,-12 780,12 806,0" fill="#ef4444"/>
+    <line class="bar" x1="806" y1="-12" x2="806" y2="12"/>
+    <line class="wire" x1="806" y1="0" x2="900" y2="0"/>
+    <line class="ray" x1="789" y1="-15" x2="797" y2="-26" marker-end="url(#arr)"/>
+    <line class="ray" x1="798" y1="-13" x2="806" y2="-24" marker-end="url(#arr)"/>
+    <circle class="dot" cx="900" cy="0" r="4"/>
+    <text class="small" x="685" y="-16" text-anchor="middle">R5 · 220 Ω</text>
+    <text class="small" x="793" y="30"  text-anchor="middle">Red · IAQ &gt; 150</text>
+  </g>
+
+  <!-- ============ Notes ============ -->
+  <rect x="40" y="652" width="880" height="128" rx="6" fill="#f9fafb" stroke="#d1d5db"/>
+  <text class="note" x="56" y="678">• BME680: SDO → GND selects I²C address 0x76 (SDO → 3V3 gives 0x77). CS → 3V3 selects I²C mode.</text>
+  <text class="note" x="56" y="699">• Breakout pin names vary: SCL may be labelled SCK, SDA may be SDI. Power the module from 3V3, not 5 V.</text>
+  <text class="note" x="56" y="720">• Most breakouts already have I²C pull-ups. GPIO0 / GPIO15 are strapping pins and must stay HIGH while booting.</text>
+  <text class="note" x="56" y="741">• LEDs are active-HIGH: GPIO → resistor → LED anode (long leg); cathode (flat side, short leg) → GND.</text>
+  <text class="note" x="56" y="762">• The LOLIN32's onboard LED is on GPIO5 (active-LOW), so it lights up while the green LED is off.</text>
+</svg>
