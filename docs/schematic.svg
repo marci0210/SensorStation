@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 800" width="960" height="800" font-family="Segoe UI, Helvetica, Arial, sans-serif">
   <title>SensorStation wiring schematic</title>
-  <desc>WEMOS LOLIN32 (ESP32) connected to a BME680 breakout over I2C (SDA GPIO15, SCL GPIO0) and five LEDs with series resistors on GPIO22, 5, 23, 33 and 32.</desc>
+  <desc>WEMOS LOLIN32 (ESP32) connected to a BME680 breakout over I2C (SDA GPIO15, SCL GPIO0) and five LEDs with series resistors on GPIO22, 25, 23, 33 and 32.</desc>
 
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
@@ -17,7 +17,7 @@
       .bar   { stroke: #1f2937; stroke-width: 3; }
       .ray   { stroke: #1f2937; stroke-width: 1.5; }
       .dot   { fill: #1f2937; }
-      .pin   { font-size: 13px; fill: #111827; }schematic 
+      .pin   { font-size: 13px; fill: #111827; }
       .small { font-size: 12px; fill: #374151; }
       .name  { font-size: 16px; font-weight: 700; fill: #111827; }
       .rail  { font-size: 13px; font-weight: 700; }
@@ -75,7 +75,7 @@
   <text class="pin" x="370" y="264">GPIO15 (SDA)</text>
   <text class="pin" x="370" y="324">GPIO0 (SCL)</text>
   <text class="pin" x="590" y="204" text-anchor="end">GPIO22</text>
-  <text class="pin" x="590" y="284" text-anchor="end">GPIO5</text>
+  <text class="pin" x="590" y="284" text-anchor="end">GPIO25</text>
   <text class="pin" x="590" y="364" text-anchor="end">GPIO23</text>
   <text class="pin" x="590" y="444" text-anchor="end">GPIO33</text>
   <text class="pin" x="590" y="524" text-anchor="end">GPIO32</text>
@@ -102,7 +102,7 @@
     <text class="small" x="793" y="30"  text-anchor="middle">Blue · Wi-Fi status</text>
   </g>
 
-  <!-- Green, GPIO5 -->
+  <!-- Green, GPIO25 -->
   <g transform="translate(0,280)">
     <line class="wire" x1="600" y1="0" x2="650" y2="0"/>
     <rect class="res" x="650" y="-9" width="70" height="18"/>
@@ -168,5 +168,5 @@
   <text class="note" x="56" y="699">• Breakout pin names vary: SCL may be labelled SCK, SDA may be SDI. Power the module from 3V3, not 5 V.</text>
   <text class="note" x="56" y="720">• Most breakouts already have I²C pull-ups. GPIO0 / GPIO15 are strapping pins and must stay HIGH while booting.</text>
   <text class="note" x="56" y="741">• LEDs are active-HIGH: GPIO → resistor → LED anode (long leg); cathode (flat side, short leg) → GND.</text>
-  <text class="note" x="56" y="762">• The LOLIN32's onboard LED is on GPIO5 (active-LOW), so it lights up while the green LED is off.</text>
+  <text class="note" x="56" y="762">• The LOLIN32's onboard LED is on GPIO5 (active-LOW). The firmware keeps GPIO5 HIGH (LED off): leave GPIO5 unconnected.</text>
 </svg>

@@ -40,7 +40,7 @@ The device-to-server contract (request format, signing, response codes, acceptan
 - **BSEC-based IAQ**: IAQ index with accuracy (0–3), plus heat-compensated temperature and humidity
   with a configurable temperature offset for self-heating.
 - **Persistent calibration**: the BSEC calibration state is saved to flash when the IAQ accuracy improves, every 6 h
-  once fully calibrated, and before any self-restart. It is restored on boot.
+  while the accuracy is 1–3 (never over a stored state of higher accuracy), and before any self-restart. It is restored on boot.
 - **Status LEDs**: one LED shows Wi-Fi status and four LEDs show the air-quality level.
 - **Captive-portal Wi-Fi setup** through [WiFiManager](https://github.com/tzapu/WiFiManager). It opens
   automatically when the saved network can't be reached, or on demand by **pressing RST twice within 3 seconds**.
@@ -108,13 +108,13 @@ side) → GND**. They are active-HIGH.
 | LED | ESP32 GPIO | Resistor | Meaning |
 |---|---|---|---|
 | Blue | **GPIO 22** | 100 Ω | Wi-Fi status |
-| Green | **GPIO 5** | 220 Ω | IAQ 0–50 |
+| Green | **GPIO 25** | 220 Ω | IAQ 0–50 |
 | White | **GPIO 23** | 100 Ω | IAQ 51–100 |
 | Yellow | **GPIO 33** | 220 Ω | IAQ 101–150 |
 | Red | **GPIO 32** | 220 Ω | IAQ > 150 |
 
-> The LOLIN32's **onboard LED is also on GPIO 5** but is active-LOW, so it is lit whenever the green LED is off.
-> This is expected.
+> The LOLIN32's **onboard LED is on GPIO 5** (active-LOW). The firmware keeps GPIO 5 HIGH, so it stays off. Don't
+> wire anything to GPIO 5.
 
 ---
 
@@ -256,7 +256,7 @@ optionally, the **default** ingest server, which is used until another one is sa
 | `WIFI_RECONNECT_INTERVAL_MS` | 30 s | How often `WiFi.reconnect()` is called while offline |
 | `WIFI_LOST_RESTART_MS` | 15 min | Reboot if Wi-Fi stays down this long |
 | `NO_RESPONSE_RESTART_MS` | 1 h | Reboot if the ingest server hasn't answered at all (any HTTP status) for this long |
-| `STATE_SAVE_PERIOD_MS` | 6 h | Re-save the calibrated BSEC state this often |
+| `STATE_SAVE_PERIOD_MS` | 6 h | Re-save the BSEC state this often (at accuracy 1–3) |
 | `DEFAULT_TEMP_OFFSET` | `0.0` | Temperature offset until one is set in the portal |
 | `WDT_TIMEOUT_S` | `60` | Task watchdog: reboot if `loop()` or the upload task stops running for this long |
 | `BUFFER_CAPACITY` (`ingest.cpp`) | 180 | Unsent readings kept (3 h); when full, the oldest is dropped |
@@ -456,7 +456,7 @@ loop()  (core 1)
  ├─ handle_wifi(): on loss → blink blue, WiFi.reconnect() every 30 s
  ├─ when iaqSensor.run() returns a new sample (≈ every 3 s):
  │    ├─ read temperature, humidity, IAQ + accuracy
- │    ├─ save BSEC state if accuracy improved (or every 6 h when calibrated)
+ │    ├─ save BSEC state if accuracy improved (or every 6 h at accuracy 1–3)
  │    └─ once a minute:
  │         ├─ update the IAQ colour LED
  │         └─ ingest::enqueue(): add the reading, with the time it was taken, to the ring buffer
@@ -609,7 +609,7 @@ offset smaller and more stable. Re-check the offset if you move the station or c
 | No requests at all, Wi-Fi is up | The clock isn't set yet: the device sends nothing until NTP works. Check that the network allows NTP (UDP 123) to `pool.ntp.org` / `time.google.com`. |
 | Board reboots about once an hour | The ingest server hasn't answered for an hour (stopped, wrong host/port, firewall). Readings stay buffered across these reboots (up to 3 h). |
 | Captive portal doesn't show up | Connect to `ESP_SensorKit` and browse to `http://192.168.4.1` manually. |
-| Onboard LED lights up | Expected: it's on GPIO 5 (active-LOW) and is lit whenever the green LED is off. |
+| Onboard LED lights up | Old firmware: it is on GPIO 5, where the green LED used to be. Flash the current firmware and move the green LED to GPIO 25. |
 
 ---
 

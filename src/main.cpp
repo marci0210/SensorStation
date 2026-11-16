@@ -36,10 +36,12 @@
 #define SCL_PIN 0
 
 #define BLUE_LED_PIN 22
-#define GREEN_LED_PIN 5
+#define GREEN_LED_PIN 25
 #define WHITE_LED_PIN 23
 #define YELLOW_LED_PIN 33
 #define RED_LED_PIN 32
+// The LOLIN32's onboard LED is on GPIO 5 and is active-LOW: kept HIGH (off) all the time
+#define ONBOARD_LED_PIN 5
 
 // Persoboard ingest server: defaults only. The real values are set in the Wi-Fi portal ("Setup" page) and
 // kept in flash. Local: the PC's IP address or name, port 8443; OpenShift: the ingest Route host, port 443.
@@ -71,7 +73,7 @@
 #define WIFI_RECONNECT_INTERVAL_MS  (30UL * 1000UL)                  // nudge Wi-Fi every 30 s while offline
 #define WIFI_LOST_RESTART_MS        (15UL * 60UL * 1000UL)           // reboot if Wi-Fi stays down for 15 min
 #define NO_RESPONSE_RESTART_MS      (60UL * 60UL * 1000UL)           // reboot if the server hasn't answered for 1 h
-#define STATE_SAVE_PERIOD_MS        (6UL * 60UL * 60UL * 1000UL)     // re-save calibrated BSEC state every 6 h
+#define STATE_SAVE_PERIOD_MS        (6UL * 60UL * 60UL * 1000UL)     // re-save BSEC state every 6 h (accuracy 1..3)
 #define BLINK_INTERVAL_MS           500u
 
 // Wi-Fi provisioning (WiFiManager)
@@ -270,11 +272,12 @@ void saveState() {
     send_message("BSEC state saved to EEPROM. Accuracy: " + String(savedAccuracy));
 }
 
-// Save when the accuracy improved, and every STATE_SAVE_PERIOD_MS once fully calibrated (Bosch recommendation).
+// Save when the accuracy improved, and every STATE_SAVE_PERIOD_MS while calibrating or calibrated (accuracy 1..3).
+// The periodic save never overwrites a stored state of higher accuracy (e.g. a temporary drop from 3 to 2).
 void maybe_save_state() {
     uint8_t acc = iaqSensor.iaqAccuracy;
     bool improved = acc > savedAccuracy;
-    bool periodic = (acc >= 3u) && (millis() - lastStateSave >= STATE_SAVE_PERIOD_MS);
+    bool periodic = (acc >= 1u) && (acc >= savedAccuracy) && (millis() - lastStateSave >= STATE_SAVE_PERIOD_MS);
     if (improved || periodic) {
         saveState();
     }
@@ -619,6 +622,8 @@ void setup() {
     }
     send_message("Reset reason: " + String((int)esp_reset_reason()));
 
+    pinMode(ONBOARD_LED_PIN, OUTPUT);
+    digitalWrite(ONBOARD_LED_PIN, HIGH);   // onboard LED off
     pinMode(BLUE_LED_PIN, OUTPUT);
     pinMode(RED_LED_PIN, OUTPUT);
     pinMode(WHITE_LED_PIN, OUTPUT);
